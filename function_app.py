@@ -60,6 +60,14 @@ HTML_PAGE = """
         <input id="capacity" type="number" min="1" value="5" />
       </div>
 
+      <div class="row">
+        <label>Distance calculation</label>
+        <select id="distanceMode">
+          <option value="direct" selected>Direct (Haversine)</option>
+          <option value="osrm">Real road kms (OSRM)</option>
+        </select>
+      </div>
+
       <div class="row" style="display:flex; gap:8px;">
         <button id="solveBtn">Solve VRP</button>
         <button id="clearBtn">Clear</button>
@@ -85,6 +93,7 @@ HTML_PAGE = """
       let markers = [];
       let routeLayers = [];
       let customerId = 1;
+      const OSRM_PUBLIC_BASE_URL = 'https://router.project-osrm.org';
 
       const colors = ['#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#a65628'];
 
@@ -106,6 +115,30 @@ HTML_PAGE = """
       function clearRoutes() {
         routeLayers.forEach(l => map.removeLayer(l));
         routeLayers = [];
+      }
+
+      async function fetchOsrmRoadGeometry(stops) {
+        if (!Array.isArray(stops) || stops.length < 2) {
+          return null;
+        }
+
+        const coords = stops.map(s => `${s.lng},${s.lat}`).join(';');
+        const url = `${OSRM_PUBLIC_BASE_URL}/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=false`;
+
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            return null;
+          }
+          const data = await resp.json();
+          const geometry = data?.routes?.[0]?.geometry?.coordinates;
+          if (!Array.isArray(geometry) || geometry.length < 2) {
+            return null;
+          }
+          return geometry.map(([lng, lat]) => [lat, lng]);
+        } catch (_) {
+          return null;
+        }
       }
 
       map.on('click', (e) => {
@@ -142,7 +175,8 @@ HTML_PAGE = """
           depot,
           customers,
           vehicles: parseInt(document.getElementById('vehicles').value, 10),
-          capacity: parseInt(document.getElementById('capacity').value, 10)
+          capacity: parseInt(document.getElementById('capacity').value, 10),
+          distance_mode: document.getElementById('distanceMode').value
         };
 
         const resp = await fetch('/solve_vrp', {
@@ -152,7 +186,12 @@ HTML_PAGE = """
         });
 
         if (!resp.ok) {
-          document.getElementById('output').textContent = 'Error solving VRP';
+          let message = 'Error solving VRP';
+          try {
+            const errData = await resp.json();
+            message = errData.error || message;
+          } catch (_) {}
+          document.getElementById('output').textContent = message;
           return;
         }
 
@@ -160,11 +199,17 @@ HTML_PAGE = """
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
 
         clearRoutes();
-        data.routes.forEach((r, idx) => {
-          const latlngs = r.stops.map(s => [s.lat, s.lng]);
+        await Promise.all(data.routes.map(async (r, idx) => {
+          let latlngs = r.stops.map(s => [s.lat, s.lng]);
+          if (payload.distance_mode === 'osrm') {
+            const roadLatLngs = await fetchOsrmRoadGeometry(r.stops);
+            if (roadLatLngs) {
+              latlngs = roadLatLngs;
+            }
+          }
           const line = L.polyline(latlngs, { color: colors[idx % colors.length], weight: 4 }).addTo(map);
           routeLayers.push(line);
-        });
+        }));
       });
     </script>
   </body>
@@ -186,6 +231,10 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
     customers = payload.get("customers", [])
     vehicles = max(1, int(payload.get("vehicles", 1)))
     capacity = max(1, int(payload.get("capacity", 1)))
+    distance_mode = str(payload.get("distance_mode", "direct")).lower().strip()
+    osrm_base_url = str(
+        payload.get("osrm_base_url", "https://router.project-osrm.org")
+    ).strip()
 
     if not depot or not isinstance(customers, list) or len(customers) == 0:
         return func.HttpResponse(
@@ -194,7 +243,21 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
         )
 
-    result = solve_vrp_nearest_neighbor(depot, customers, vehicles, capacity)
+    try:
+        result = solve_vrp_nearest_neighbor(
+            depot,
+            customers,
+            vehicles,
+            capacity,
+            distance_mode=distance_mode,
+            osrm_base_url=osrm_base_url,
+        )
+    except RuntimeError as exc:
+        return func.HttpResponse(
+            json.dumps({"error": str(exc)}),
+            mimetype="application/json",
+            status_code=502,
+        )
     return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
 
 
