@@ -1,25 +1,36 @@
-# VRP básico con OpenStreetMap + Azure Functions
+# Basic VRP with OpenStreetMap + Azure Functions
 
-Este repositorio contiene un programa base para resolver un **Vehicle Routing Problem (VRP)** usando un heurístico simple (vecino más cercano con restricción de capacidad), con:
+This project provides a small Vehicle Routing Problem (VRP) demo:
 
-- **Interfaz gráfica web** sobre **OpenStreetMap** (Leaflet).
-- **Entrada/salida visual** (clic para crear depósito/clientes y visualización de rutas).
-- **Backend en Azure Functions** listo para desplegar en Azure.
+- Web UI with OpenStreetMap (Leaflet)
+- HTTP API to solve VRP with a nearest-neighbor heuristic and capacity limits
+- Azure Functions Python app ready for local run and deployment
 
-## Estructura
+## Project structure
 
-- `function_app.py`: Azure Function HTTP con dos endpoints:
-  - `GET /api/` devuelve la interfaz HTML.
-  - `POST /api/solve_vrp` resuelve el VRP y devuelve JSON.
-- `requirements.txt`: dependencias Python.
-- `host.json`: configuración de Azure Functions.
+- `function_app.py`: HTTP routes and UI page
+- `solve_vrp/__init__.py`: VRP solver logic
+- `host.json`: Function host settings
+- `local.settings.json`: Local runtime settings
+- `requirements.txt`: Dependencies
 
-## Requisitos
+## Requirements
 
 - Python 3.10+
-- Azure Functions Core Tools (`func`)
+- Azure Functions Core Tools v4 (`func`)
 
-## Ejecución local
+## Run locally
+
+### PowerShell (Windows)
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+func start
+```
+
+### Bash
 
 ```bash
 python -m venv .venv
@@ -28,36 +39,12 @@ pip install -r requirements.txt
 func start
 ```
 
-Abre en navegador:
+Open one of these URLs:
 
-- `http://localhost:7071/api/`
+- `http://localhost:7071/`
+- `http://localhost:7071/api`
 
-## Uso rápido
+Both solve endpoints are available:
 
-1. Selecciona **Definir depósito** y haz clic en el mapa.
-2. Cambia a **Añadir cliente** y haz clic para añadir clientes.
-3. Ajusta demanda, número de vehículos y capacidad.
-4. Haz clic en **Resolver VRP**.
-5. Verás rutas dibujadas en el mapa y la salida JSON en el panel.
-
-## Despliegue en Azure
-
-Con Azure CLI y Core Tools autenticados:
-
-```bash
-az login
-az group create --name rg-vrp-demo --location westeurope
-az storage account create --name vrpstorage$RANDOM --location westeurope --resource-group rg-vrp-demo --sku Standard_LRS
-az functionapp create \
-  --resource-group rg-vrp-demo \
-  --consumption-plan-location westeurope \
-  --runtime python \
-  --runtime-version 3.11 \
-  --functions-version 4 \
-  --name <NOMBRE_UNICO_FUNC_APP> \
-  --storage-account <STORAGE_ACCOUNT>
-
-func azure functionapp publish <NOMBRE_UNICO_FUNC_APP>
-```
-
-> Nota: para producción, conviene reemplazar el heurístico por OR-Tools o un solver más robusto.
+- `POST http://localhost:7071/solve_vrp`
+- `POST http://localhost:7071/api/solve_vrp`
