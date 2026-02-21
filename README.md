@@ -3,7 +3,7 @@
 This project provides a small Vehicle Routing Problem (VRP) demo:
 
 - Web UI with OpenStreetMap (Leaflet)
-- HTTP API to solve VRP with a nearest-neighbor heuristic and capacity limits
+- HTTP API to solve VRP with a Clarke & Wright savings heuristic and capacity limits
 - Azure Functions Python app ready for local run and deployment
 
 ## Project structure
