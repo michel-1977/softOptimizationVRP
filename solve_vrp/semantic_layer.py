@@ -1,12 +1,20 @@
 from datetime import datetime, timedelta, timezone
 import math
+import os
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from solve_vrp.here_emulator import HerePlatformEmulator
+from solve_vrp.here_platform import HerePlatformClient
 
 EARTH_RADIUS_KM = 6371.0
 
 DEFAULT_SEMANTIC_RADIUS_KM = 1.2
 DEFAULT_TOP_K = 8
 DEFAULT_AVG_SPEED_KMH = 40.0
+DEFAULT_HERE_TIMEOUT_SEC = 12
+DEFAULT_HERE_TRAFFIC_RADIUS_M = 300
+DEFAULT_HERE_FORECAST_WINDOW_HOURS = 24
+DEFAULT_HERE_FORECAST_INTERVAL_MIN = 120
 
 KNOWN_CATEGORY_MAP = {
     ("amenity", "fuel"): "fuel",
@@ -44,6 +52,29 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _resolve_here_data_source(value: Any) -> str:
+    raw = str(value or "here").strip().lower()
+    if raw in {"emulator", "mock", "simulated", "synthetic"}:
+        return "emulator"
+    return "here"
 
 
 def _to_iso_z(dt: Optional[datetime]) -> Optional[str]:
@@ -270,7 +301,7 @@ def _format_weather_context(
             "observed_at_utc": None,
         }
 
-    return {
+    formatted = {
         "status": "observed",
         "source": observation.get("source", "external_weather_feed"),
         "temperature_c": observation.get("temperature_c"),
@@ -282,6 +313,26 @@ def _format_weather_context(
         "time_offset_min": (
             round(time_offset_min, 1) if time_offset_min is not None else None
         ),
+    }
+    forecast = observation.get("forecast_24h")
+    if isinstance(forecast, dict):
+        formatted["forecast_24h"] = forecast
+    return formatted
+
+
+def _unknown_weather_forecast(
+    window_hours: int,
+    interval_min: Optional[int],
+    source: str = "not_provided",
+) -> Dict[str, Any]:
+    return {
+        "status": "unknown",
+        "source": source,
+        "window_hours": window_hours,
+        "interval_min": interval_min,
+        "worst_case_score": None,
+        "worst_slots": [],
+        "evaluated_slots": 0,
     }
 
 
@@ -300,7 +351,7 @@ def _format_traffic_context(
             "observed_at_utc": None,
         }
 
-    return {
+    formatted = {
         "status": "observed",
         "source": observation.get("source", "external_traffic_feed"),
         "congestion_level": observation.get("congestion_level"),
@@ -311,6 +362,27 @@ def _format_traffic_context(
         "time_offset_min": (
             round(time_offset_min, 1) if time_offset_min is not None else None
         ),
+    }
+    forecast = observation.get("forecast_24h")
+    if isinstance(forecast, dict):
+        formatted["forecast_24h"] = forecast
+    return formatted
+
+
+def _unknown_traffic_forecast(
+    window_hours: int,
+    interval_min: int,
+    source: str = "not_provided",
+) -> Dict[str, Any]:
+    return {
+        "status": "unknown",
+        "source": source,
+        "window_hours": window_hours,
+        "interval_min": interval_min,
+        "worst_case_delay_ratio": None,
+        "worst_case_delay_seconds": None,
+        "worst_slots": [],
+        "evaluated_slots": 0,
     }
 
 
@@ -355,6 +427,8 @@ def _build_route_segments(
                 "eta_min_from_departure": round(elapsed_min, 1),
                 "eta_utc": _to_iso_z(eta_dt),
                 "midpoint": midpoint,
+                "start": {"lat": start_point[0], "lng": start_point[1]},
+                "end": {"lat": end_point[0], "lng": end_point[1]},
             }
         )
     return segments
@@ -449,10 +523,63 @@ def build_semantic_layer(
     traffic_observations = _normalize_observations(
         raw_payload.get("traffic_observations")
     )
+    here_data_source = _resolve_here_data_source(raw_payload.get("here_data_source"))
+    here_api_key = os.getenv("HERE_API_KEY", "").strip()
+    here_requested = _safe_bool(raw_payload.get("use_here_platform"), True)
+    here_enabled = (
+        here_requested and here_data_source == "emulator"
+    ) or (here_requested and here_data_source == "here" and bool(here_api_key))
+    if not here_requested:
+        here_api_key_source = "disabled"
+    elif here_data_source == "emulator":
+        here_api_key_source = "not_required_emulator"
+    else:
+        here_api_key_source = "env:HERE_API_KEY" if here_api_key else "missing_env:HERE_API_KEY"
+    here_timeout_sec = max(
+        3, _safe_int(raw_payload.get("here_timeout_sec"), DEFAULT_HERE_TIMEOUT_SEC)
+    )
+    here_traffic_radius_m = max(
+        50,
+        _safe_int(
+            raw_payload.get("here_traffic_radius_m"), DEFAULT_HERE_TRAFFIC_RADIUS_M
+        ),
+    )
+    here_forecast_window_hours = max(
+        1,
+        _safe_int(
+            raw_payload.get("here_forecast_window_hours"),
+            DEFAULT_HERE_FORECAST_WINDOW_HOURS,
+        ),
+    )
+    here_forecast_interval_min = max(
+        30,
+        _safe_int(
+            raw_payload.get("here_forecast_interval_min"),
+            DEFAULT_HERE_FORECAST_INTERVAL_MIN,
+        ),
+    )
+    here_client = None
+    if here_enabled and here_data_source == "emulator":
+        here_client = HerePlatformEmulator(
+            timeout_sec=here_timeout_sec,
+            traffic_radius_m=here_traffic_radius_m,
+            forecast_window_hours=here_forecast_window_hours,
+            forecast_step_min=here_forecast_interval_min,
+            seed=raw_payload.get("here_emulator_seed"),
+        )
+    elif here_enabled and here_data_source == "here":
+        here_client = HerePlatformClient(
+            api_key=here_api_key,
+            timeout_sec=here_timeout_sec,
+            traffic_radius_m=here_traffic_radius_m,
+            forecast_window_hours=here_forecast_window_hours,
+            forecast_step_min=here_forecast_interval_min,
+        )
 
     routes_output = []
     matched_locations = 0
     segment_records = 0
+    here_errors: List[str] = []
 
     for route in vrp_result.get("routes", []):
         stops = route.get("stops", [])
@@ -474,6 +601,92 @@ def build_semantic_layer(
             traffic_obs, traffic_dist, traffic_time = _match_observation(
                 segment["midpoint"], eta_dt, traffic_observations
             )
+            weather_context = _format_weather_context(
+                weather_obs, weather_dist, weather_time
+            )
+            traffic_context = _format_traffic_context(
+                traffic_obs, traffic_dist, traffic_time
+            )
+            if "forecast_24h" not in weather_context:
+                weather_context["forecast_24h"] = _unknown_weather_forecast(
+                    here_forecast_window_hours,
+                    here_forecast_interval_min if here_client is not None else None,
+                )
+            if "forecast_24h" not in traffic_context:
+                traffic_context["forecast_24h"] = _unknown_traffic_forecast(
+                    here_forecast_window_hours, here_forecast_interval_min
+                )
+
+            if here_client is not None:
+                segment_reference_time = eta_dt or departure_time_utc or datetime.now(
+                    tz=timezone.utc
+                )
+                midpoint = segment["midpoint"]
+                try:
+                    weather_bundle = here_client.fetch_weather(
+                        midpoint["lat"],
+                        midpoint["lng"],
+                        reference_time_utc=segment_reference_time,
+                    )
+                    weather_realtime = weather_bundle.get("realtime")
+                    if isinstance(weather_realtime, dict):
+                        if weather_realtime.get("status") == "observed":
+                            weather_context = dict(weather_realtime)
+                            weather_context["distance_km_to_segment"] = 0.0
+                            weather_context["time_offset_min"] = 0.0
+                        elif weather_context.get("status") == "unknown":
+                            weather_context = dict(weather_realtime)
+
+                    weather_forecast = weather_bundle.get("forecast_24h")
+                    if isinstance(weather_forecast, dict):
+                        weather_context["forecast_24h"] = weather_forecast
+                except RuntimeError as exc:
+                    here_errors.append(str(exc))
+                    weather_context["here_error"] = str(exc)
+
+                try:
+                    traffic_realtime = here_client.fetch_traffic_status(
+                        midpoint["lat"], midpoint["lng"]
+                    )
+                    if isinstance(traffic_realtime, dict):
+                        if traffic_realtime.get("status") == "observed":
+                            traffic_context = dict(traffic_realtime)
+                            traffic_context["distance_km_to_segment"] = 0.0
+                            traffic_context["time_offset_min"] = 0.0
+                        elif traffic_context.get("status") == "unknown":
+                            traffic_context = dict(traffic_realtime)
+                except RuntimeError as exc:
+                    here_errors.append(str(exc))
+                    traffic_context["here_error"] = str(exc)
+
+                try:
+                    traffic_forecast = here_client.fetch_traffic_forecast(
+                        segment["start"],
+                        segment["end"],
+                        reference_time_utc=segment_reference_time,
+                    )
+                    if isinstance(traffic_forecast, dict):
+                        traffic_context["forecast_24h"] = traffic_forecast
+                except RuntimeError as exc:
+                    here_errors.append(str(exc))
+                    traffic_context["forecast_24h"] = _unknown_traffic_forecast(
+                        here_forecast_window_hours,
+                        here_forecast_interval_min,
+                        source="here_routing_v8",
+                    )
+                    traffic_context["forecast_24h"]["error"] = str(exc)
+
+            if "forecast_24h" not in weather_context:
+                weather_context["forecast_24h"] = _unknown_weather_forecast(
+                    here_forecast_window_hours,
+                    here_forecast_interval_min if here_client is not None else None,
+                )
+            if "forecast_24h" not in traffic_context:
+                traffic_context["forecast_24h"] = _unknown_traffic_forecast(
+                    here_forecast_window_hours,
+                    here_forecast_interval_min,
+                )
+
             segment_context.append(
                 {
                     "segment_index": segment["segment_index"],
@@ -484,14 +697,20 @@ def build_semantic_layer(
                     "eta_min_from_departure": segment["eta_min_from_departure"],
                     "eta_utc": segment["eta_utc"],
                     "midpoint": segment["midpoint"],
-                    "weather": _format_weather_context(
-                        weather_obs, weather_dist, weather_time
-                    ),
-                    "traffic": _format_traffic_context(
-                        traffic_obs, traffic_dist, traffic_time
-                    ),
+                    "weather": weather_context,
+                    "traffic": traffic_context,
                 }
             )
+
+        by_segment_index = {
+            segment["segment_index"]: segment for segment in segment_context
+        }
+        for location in semantic_locations:
+            linked = by_segment_index.get(location.get("nearest_segment_index"))
+            if linked is None:
+                continue
+            location["weather"] = linked.get("weather")
+            location["traffic"] = linked.get("traffic")
 
         segment_records += len(segment_context)
         matched_locations += len(semantic_locations)
@@ -506,7 +725,7 @@ def build_semantic_layer(
         )
 
     return {
-        "version": "0.3",
+        "version": "0.5",
         "generated_at_utc": _to_iso_z(datetime.now(tz=timezone.utc)),
         "config": {
             "semantic_corridor_radius_km": round(radius_km, 3),
@@ -514,6 +733,14 @@ def build_semantic_layer(
             "route_avg_speed_kmh": round(avg_speed_kmh, 3),
             "semantic_categories": sorted(semantic_categories),
             "departure_time_utc": _to_iso_z(departure_time_utc),
+            "use_here_platform": bool(here_client),
+            "here_data_source": here_data_source,
+            "here_api_key_source": here_api_key_source,
+            "here_timeout_sec": here_timeout_sec,
+            "here_traffic_radius_m": here_traffic_radius_m,
+            "here_forecast_window_hours": here_forecast_window_hours,
+            "here_forecast_interval_min": here_forecast_interval_min,
+            "here_pipeline_mode": str(raw_payload.get("here_pipeline_mode", "postprocessing")),
         },
         "summary": {
             "routes_enriched": len(routes_output),
@@ -522,6 +749,11 @@ def build_semantic_layer(
             "matched_semantic_locations": matched_locations,
             "weather_observations_received": len(weather_observations),
             "traffic_observations_received": len(traffic_observations),
+            "here_platform_enabled": bool(here_client),
+            "here_data_source": here_data_source,
+            "here_errors": len(here_errors),
+            "here_client_stats": here_client.stats() if here_client is not None else {},
         },
+        "errors": here_errors[:20],
         "routes": routes_output,
     }

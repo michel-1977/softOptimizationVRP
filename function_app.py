@@ -1,8 +1,12 @@
 import json
+import os
+from datetime import datetime, timezone
 
 import azure.functions as func
 
 from solve_vrp import solve_vrp_nearest_neighbor
+from solve_vrp.here_emulator import HerePlatformEmulator
+from solve_vrp.here_platform import HerePlatformClient
 from solve_vrp.semantic_layer import build_semantic_layer
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -22,6 +26,167 @@ def _as_bool(value, default: bool) -> bool:
         if normalized in {"0", "false", "no", "n", "off"}:
             return False
     return default
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_utc_datetime(value):
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _resolve_here_pipeline_mode(value) -> str:
+    mode = str(value or "postprocessing").strip().lower()
+    if mode in {"before_vrp", "before-vrp", "before"}:
+        return "before_vrp"
+    return "postprocessing"
+
+
+def _resolve_here_data_source(value) -> str:
+    source = str(value or "here").strip().lower()
+    if source in {"emulator", "mock", "simulated", "synthetic"}:
+        return "emulator"
+    return "here"
+
+
+def _prefetch_here_point_observations(payload: dict, depot: dict, customers: list) -> dict:
+    updated_payload = dict(payload)
+    here_data_source = _resolve_here_data_source(payload.get("here_data_source"))
+    api_key = os.getenv("HERE_API_KEY", "").strip()
+    if here_data_source == "here" and not api_key:
+        updated_payload["_here_prefetch"] = {
+            "enabled": False,
+            "data_source": "here",
+            "error": "HERE_API_KEY environment variable is not set.",
+        }
+        return updated_payload
+
+    timeout_sec = max(3, _safe_int(payload.get("here_timeout_sec"), 12))
+    traffic_radius_m = max(50, _safe_int(payload.get("here_traffic_radius_m"), 300))
+    forecast_window_hours = max(1, _safe_int(payload.get("here_forecast_window_hours"), 24))
+    forecast_interval_min = max(30, _safe_int(payload.get("here_forecast_interval_min"), 120))
+    departure_time_utc = _parse_utc_datetime(payload.get("departure_time_utc")) or datetime.now(
+        tz=timezone.utc
+    )
+
+    if here_data_source == "emulator":
+        client = HerePlatformEmulator(
+            timeout_sec=timeout_sec,
+            traffic_radius_m=traffic_radius_m,
+            forecast_window_hours=forecast_window_hours,
+            forecast_step_min=forecast_interval_min,
+            seed=payload.get("here_emulator_seed"),
+        )
+    else:
+        client = HerePlatformClient(
+            api_key=api_key,
+            timeout_sec=timeout_sec,
+            traffic_radius_m=traffic_radius_m,
+            forecast_window_hours=forecast_window_hours,
+            forecast_step_min=forecast_interval_min,
+        )
+
+    weather_observations = list(
+        payload.get("weather_observations", [])
+        if isinstance(payload.get("weather_observations"), list)
+        else []
+    )
+    traffic_observations = list(
+        payload.get("traffic_observations", [])
+        if isinstance(payload.get("traffic_observations"), list)
+        else []
+    )
+    prefetch_errors = []
+
+    depot_lat = _safe_float(depot.get("lat"))
+    depot_lng = _safe_float(depot.get("lng"))
+    points = [depot] + [c for c in customers if isinstance(c, dict)]
+
+    for point in points:
+        lat = _safe_float(point.get("lat"))
+        lng = _safe_float(point.get("lng"))
+        if lat is None or lng is None:
+            continue
+
+        try:
+            weather_bundle = client.fetch_weather(lat, lng, reference_time_utc=departure_time_utc)
+            realtime = weather_bundle.get("realtime", {})
+            weather_observations.append(
+                {
+                    "lat": lat,
+                    "lng": lng,
+                    "time_utc": realtime.get("observed_at_utc") or departure_time_utc.isoformat().replace("+00:00", "Z"),
+                    "temperature_c": realtime.get("temperature_c"),
+                    "precipitation_mm": realtime.get("precipitation_mm"),
+                    "wind_kph": realtime.get("wind_kph"),
+                    "condition": realtime.get("condition"),
+                    "source": realtime.get("source", "here_weather_v3"),
+                    "forecast_24h": weather_bundle.get("forecast_24h"),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - keep VRP flow resilient
+            prefetch_errors.append(f"weather prefetch failed at {lat},{lng}: {exc}")
+
+        try:
+            traffic_realtime = client.fetch_traffic_status(lat, lng)
+            traffic_forecast = None
+            if depot_lat is not None and depot_lng is not None and (lat != depot_lat or lng != depot_lng):
+                traffic_forecast = client.fetch_traffic_forecast(
+                    {"lat": depot_lat, "lng": depot_lng},
+                    {"lat": lat, "lng": lng},
+                    reference_time_utc=departure_time_utc,
+                )
+            traffic_observations.append(
+                {
+                    "lat": lat,
+                    "lng": lng,
+                    "time_utc": traffic_realtime.get("observed_at_utc") or departure_time_utc.isoformat().replace("+00:00", "Z"),
+                    "congestion_level": traffic_realtime.get("congestion_level"),
+                    "speed_kmh": traffic_realtime.get("speed_kmh"),
+                    "incident_count": traffic_realtime.get("incident_count"),
+                    "source": traffic_realtime.get("source", "here_traffic_v7"),
+                    "forecast_24h": traffic_forecast,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - keep VRP flow resilient
+            prefetch_errors.append(f"traffic prefetch failed at {lat},{lng}: {exc}")
+
+    updated_payload["weather_observations"] = weather_observations
+    updated_payload["traffic_observations"] = traffic_observations
+    # In before_vrp mode, do not call HERE again in post-processing.
+    updated_payload["use_here_platform"] = False
+    updated_payload["_here_prefetch"] = {
+        "enabled": True,
+        "data_source": here_data_source,
+        "points_queried": len(points),
+        "errors": prefetch_errors[:20],
+        "client_stats": client.stats(),
+    }
+    return updated_payload
 
 
 HTML_PAGE = """
@@ -149,9 +314,41 @@ HTML_PAGE = """
         </select>
       </div>
 
+      <div class="row">
+        <label>HERE data source</label>
+        <select id="hereDataSource">
+          <option value="here" selected>Live HERE APIs</option>
+          <option value="emulator">HERE emulator (randomized)</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label>HERE pipeline</label>
+        <select id="hereMode">
+          <option value="postprocessing" selected>HERE postprocessing (after VRP)</option>
+          <option value="before_vrp">HERE before VRP (prefetch)</option>
+        </select>
+        <div class="small">Live HERE mode uses env var <code>HERE_API_KEY</code> (local.settings.json or Azure App Settings). Emulator mode needs no key.</div>
+      </div>
+
+      <div class="row" style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
+        <div>
+          <label>Forecast interval (min)</label>
+          <input id="hereForecastInterval" type="number" min="30" step="30" value="120" />
+        </div>
+        <div>
+          <label>Traffic radius (m)</label>
+          <input id="hereTrafficRadius" type="number" min="50" step="50" value="300" />
+        </div>
+      </div>
+
       <div class="row" style="display:flex; gap:8px;">
         <button id="solveBtn">Solve VRP</button>
         <button id="clearBtn">Clear</button>
+      </div>
+      <div class="row">
+        <button id="autogenBtn" type="button">Autogenerate VRP Problem</button>
+        <div class="small">Loads your 1 depot + 9 customers reference scenario.</div>
       </div>
 
       <div class="row">
@@ -221,6 +418,40 @@ HTML_PAGE = """
         return segments.find(s => s.segment_index === nearestSegmentIndex) || null;
       }
 
+      function toUtcLabel(value) {
+        if (!value) {
+          return 'n/a';
+        }
+        try {
+          return new Date(value).toISOString().slice(0, 16).replace('T', ' ') + 'Z';
+        } catch (_) {
+          return escapeHtml(value);
+        }
+      }
+
+      function summarizeWeatherForecast(weather) {
+        const forecast = weather?.forecast_24h || {};
+        if (forecast?.status !== 'forecasted') {
+          return 'unknown';
+        }
+        const score = Number(forecast?.worst_case_score ?? 0).toFixed(2);
+        const slots = Array.isArray(forecast?.worst_slots) ? forecast.worst_slots : [];
+        const labels = slots.slice(0, 3).map(slot => toUtcLabel(slot?.start_utc)).join(', ');
+        return `score ${escapeHtml(score)} at ${escapeHtml(labels || 'n/a')}`;
+      }
+
+      function summarizeTrafficForecast(traffic) {
+        const forecast = traffic?.forecast_24h || {};
+        if (forecast?.status !== 'forecasted') {
+          return 'unknown';
+        }
+        const ratio = Number(forecast?.worst_case_delay_ratio ?? 0).toFixed(3);
+        const delay = Number(forecast?.worst_case_delay_seconds ?? 0).toFixed(0);
+        const slots = Array.isArray(forecast?.worst_slots) ? forecast.worst_slots : [];
+        const labels = slots.slice(0, 3).map(slot => toUtcLabel(slot?.departure_utc)).join(', ');
+        return `ratio ${escapeHtml(ratio)} (+${escapeHtml(delay)}s) at ${escapeHtml(labels || 'n/a')}`;
+      }
+
       function semanticPopupHtml(vehicle, location, segmentContext) {
         const weather = segmentContext?.weather || {};
         const traffic = segmentContext?.traffic || {};
@@ -236,6 +467,8 @@ HTML_PAGE = """
         const trafficSummary = traffic?.status === 'observed'
           ? `congestion ${escapeHtml(traffic.congestion_level || 'n/a')}, speed ${escapeHtml(traffic.speed_kmh ?? 'n/a')} km/h`
           : 'unknown';
+        const weatherForecastSummary = summarizeWeatherForecast(weather);
+        const trafficForecastSummary = summarizeTrafficForecast(traffic);
 
         return `
           <div class="semantic-popup">
@@ -247,7 +480,9 @@ HTML_PAGE = """
             <div><strong>Estimated detour:</strong> ${detour} km</div>
             <div><strong>Segment ETA:</strong> ${eta}</div>
             <div><strong>Weather:</strong> ${weatherSummary}</div>
+            <div><strong>Weather 24h worst:</strong> ${weatherForecastSummary}</div>
             <div><strong>Traffic:</strong> ${trafficSummary}</div>
+            <div><strong>Traffic 24h worst:</strong> ${trafficForecastSummary}</div>
             <div class="muted">Lat/Lng: ${escapeHtml(location.lat)}, ${escapeHtml(location.lng)}</div>
           </div>
         `;
@@ -264,6 +499,8 @@ HTML_PAGE = """
         const trafficSummary = traffic?.status === 'observed'
           ? `congestion ${escapeHtml(traffic.congestion_level || 'n/a')}, speed ${escapeHtml(traffic.speed_kmh ?? 'n/a')} km/h`
           : 'unknown';
+        const weatherForecastSummary = summarizeWeatherForecast(weather);
+        const trafficForecastSummary = summarizeTrafficForecast(traffic);
 
         return `
           <div class="semantic-popup">
@@ -273,7 +510,9 @@ HTML_PAGE = """
             <div><strong>Segment distance:</strong> ${distance} km</div>
             <div><strong>ETA:</strong> ${eta}</div>
             <div><strong>Weather:</strong> ${weatherSummary}</div>
+            <div><strong>Weather 24h worst:</strong> ${weatherForecastSummary}</div>
             <div><strong>Traffic:</strong> ${trafficSummary}</div>
+            <div><strong>Traffic 24h worst:</strong> ${trafficForecastSummary}</div>
             <div class="muted">No semantic POI matched in this corridor window.</div>
           </div>
         `;
@@ -319,9 +558,11 @@ HTML_PAGE = """
           }
 
           if (semanticLocations.length === 0 && segmentContext.length > 0) {
-            const sampledSegments = segmentContext
-              .filter((segment, index) => index % 2 === 0)
-              .slice(0, 12);
+            let sampledSegments = segmentContext;
+            if (segmentContext.length > 12) {
+              const step = Math.ceil(segmentContext.length / 12);
+              sampledSegments = segmentContext.filter((_, index) => index % step === 0).slice(0, 12);
+            }
 
             for (const segment of sampledSegments) {
               const midpoint = segment?.midpoint;
@@ -390,6 +631,31 @@ HTML_PAGE = """
         document.getElementById('output').textContent = 'Waiting for data...';
       });
 
+      document.getElementById('autogenBtn').addEventListener('click', () => {
+        depot = { id: 'depot', lat: 40.413496049701955, lng: -3.7792968750000004 };
+        customers = [
+          { id: 1, lat: 42.58544425738491, lng: -5.559082031250001, demand: 2 },
+          { id: 2, lat: 42.342305278572816, lng: -7.558593750000001, demand: 2 },
+          { id: 3, lat: 41.57436130598913, lng: -0.9008789062500001, demand: 2 },
+          { id: 4, lat: 40.44694705960048, lng: -1.8676757812500002, demand: 2 },
+          { id: 5, lat: 37.94419750075404, lng: -5.009765625000001, demand: 2 },
+          { id: 6, lat: 38.95940879245423, lng: -1.0546875000000002, demand: 2 },
+          { id: 7, lat: 39.554883059924016, lng: -4.724121093750001, demand: 2 },
+          { id: 8, lat: 40.027614437486655, lng: -6.35009765625, demand: 2 },
+          { id: 9, lat: 37.54457732085584, lng: -2.3291015625000004, demand: 2 }
+        ];
+        customerId = 10;
+
+        document.getElementById('vehicles').value = 5;
+        document.getElementById('capacity').value = 5;
+        document.getElementById('demand').value = 2;
+
+        clearRoutes();
+        redrawPoints();
+        map.setView([40.413496049701955, -3.7792968750000004], 6);
+        document.getElementById('output').textContent = 'Autogenerated reference VRP loaded. Click Solve VRP.';
+      });
+
       document.getElementById('solveBtn').addEventListener('click', async () => {
         if (!depot) {
           alert('You must define a depot.');
@@ -405,8 +671,17 @@ HTML_PAGE = """
           customers,
           vehicles: parseInt(document.getElementById('vehicles').value, 10),
           capacity: parseInt(document.getElementById('capacity').value, 10),
-          distance_mode: document.getElementById('distanceMode').value
+          distance_mode: document.getElementById('distanceMode').value,
+          include_semantic_layer: true,
+          departure_time_utc: new Date().toISOString(),
+          here_pipeline_mode: document.getElementById('hereMode').value,
+          here_data_source: document.getElementById('hereDataSource').value,
+          use_here_platform: true
         };
+
+        payload.here_forecast_window_hours = 24;
+        payload.here_forecast_interval_min = Math.max(30, parseInt(document.getElementById('hereForecastInterval').value || '120', 10));
+        payload.here_traffic_radius_m = Math.max(50, parseInt(document.getElementById('hereTrafficRadius').value || '300', 10));
 
         const resp = await fetch('/solve_vrp', {
           method: 'POST',
@@ -473,6 +748,19 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
         )
 
+    here_pipeline_mode = _resolve_here_pipeline_mode(payload.get("here_pipeline_mode"))
+    here_data_source = _resolve_here_data_source(payload.get("here_data_source"))
+    semantic_payload = dict(payload)
+    semantic_payload["here_pipeline_mode"] = here_pipeline_mode
+    semantic_payload["here_data_source"] = here_data_source
+
+    if here_pipeline_mode == "before_vrp" and _as_bool(
+        semantic_payload.get("use_here_platform"), True
+    ):
+        semantic_payload = _prefetch_here_point_observations(
+            semantic_payload, depot, customers
+        )
+
     try:
         result = solve_vrp_nearest_neighbor(
             depot,
@@ -488,9 +776,29 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=502,
         )
+    except Exception as exc:  # noqa: BLE001 - keep response stable
+        return func.HttpResponse(
+            json.dumps({"error": f"Unexpected VRP error: {exc}"}),
+            mimetype="application/json",
+            status_code=500,
+        )
 
-    if _as_bool(payload.get("include_semantic_layer"), True):
-        result["semantic_layer"] = build_semantic_layer(result, payload)
+    if _as_bool(semantic_payload.get("include_semantic_layer"), True):
+        try:
+            result["semantic_layer"] = build_semantic_layer(result, semantic_payload)
+        except Exception as exc:  # noqa: BLE001 - never block VRP result
+            result["semantic_layer"] = {
+                "status": "failed",
+                "error": str(exc),
+                "pipeline_mode": here_pipeline_mode,
+                "here_data_source": here_data_source,
+            }
+            result["semantic_layer_error"] = (
+                "Semantic enrichment failed; VRP result remains valid."
+            )
+
+    if "_here_prefetch" in semantic_payload:
+        result["here_prefetch"] = semantic_payload["_here_prefetch"]
 
     return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
 
