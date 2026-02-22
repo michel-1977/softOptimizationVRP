@@ -14,7 +14,7 @@ This project provides a small Vehicle Routing Problem (VRP) demo:
 - `solve_vrp/here_platform.py`: HERE API integration (weather + traffic real-time and forecast aggregation)
 - `solve_vrp/here_emulator.py`: HERE-like emulator for weather/traffic structures
 - `host.json`: Function host settings
-- `local.settings.json`: Local runtime settings
+- `local.settings.example.json`: Safe template for local runtime settings
 - `requirements.txt`: Dependencies
 
 ## Requirements
@@ -92,7 +92,7 @@ Without HERE key in live mode, the system falls back to user-provided `weather_o
 
 ### Local key setup
 
-For local Azure Functions runs, set your HERE key in `local.settings.json`:
+For local Azure Functions runs, copy `local.settings.example.json` to `local.settings.json` and set your HERE key:
 
 ```json
 {

@@ -2,4 +2,4 @@ __pycache__/
 *.pyc
 .venv/
 .env
-.local.settings.json
+local.settings.json
