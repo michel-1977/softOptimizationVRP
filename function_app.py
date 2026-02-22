@@ -3,8 +3,25 @@ import json
 import azure.functions as func
 
 from solve_vrp import solve_vrp_nearest_neighbor
+from solve_vrp.semantic_layer import build_semantic_layer
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+
+def _as_bool(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
 
 
 HTML_PAGE = """
@@ -30,6 +47,70 @@ HTML_PAGE = """
       button { cursor: pointer; }
       pre { background: #f7f7f7; padding: 10px; font-size: 12px; overflow:auto; }
       .small { font-size: 12px; color: #555; }
+      .semantic-anchor-shell {
+        background: transparent;
+        border: none;
+      }
+      .semantic-anchor-icon {
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        border: 2px solid #274c77;
+        color: #274c77;
+        background: #ffffff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 9px;
+        font-weight: 700;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+      }
+      .semantic-segment-icon {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 1px solid #274c77;
+        background: #ffffff;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.22);
+      }
+      .legend {
+        margin-top: 8px;
+        padding: 8px;
+        border: 1px solid #ddd;
+        background: #fafafa;
+        border-radius: 6px;
+      }
+      .legend-title {
+        font-size: 12px;
+        font-weight: 700;
+        margin-bottom: 6px;
+      }
+      .legend-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 4px;
+        font-size: 12px;
+      }
+      .legend-dot-poi {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid #274c77;
+        background: #d6e7ff;
+        display: inline-block;
+      }
+      .legend-dot-segment {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        border: 1px solid #274c77;
+        background: #ffffff;
+        display: inline-block;
+      }
+      .semantic-popup { font-size: 12px; line-height: 1.35; }
+      .semantic-popup h4 { margin: 0 0 5px 0; font-size: 13px; }
+      .semantic-popup .muted { color: #666; }
     </style>
   </head>
   <body>
@@ -76,6 +157,12 @@ HTML_PAGE = """
       <div class="row">
         <strong>Output</strong>
         <pre id="output">Waiting for data...</pre>
+        <div class="small">Click map dots to inspect semantic + weather + traffic details.</div>
+        <div class="legend">
+          <div class="legend-title">Map Legend</div>
+          <div class="legend-row"><span class="legend-dot-poi"></span><span>Semantic POI match</span></div>
+          <div class="legend-row"><span class="legend-dot-segment"></span><span>Segment context fallback</span></div>
+        </div>
       </div>
     </div>
     <div id="map"></div>
@@ -92,6 +179,7 @@ HTML_PAGE = """
       let customers = [];
       let markers = [];
       let routeLayers = [];
+      let semanticMarkers = [];
       let customerId = 1;
       const OSRM_PUBLIC_BASE_URL = 'https://router.project-osrm.org';
 
@@ -115,6 +203,147 @@ HTML_PAGE = """
       function clearRoutes() {
         routeLayers.forEach(l => map.removeLayer(l));
         routeLayers = [];
+        semanticMarkers.forEach(m => map.removeLayer(m));
+        semanticMarkers = [];
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function pickSegmentContext(routeSemantic, nearestSegmentIndex) {
+        const segments = Array.isArray(routeSemantic?.segment_context) ? routeSemantic.segment_context : [];
+        return segments.find(s => s.segment_index === nearestSegmentIndex) || null;
+      }
+
+      function semanticPopupHtml(vehicle, location, segmentContext) {
+        const weather = segmentContext?.weather || {};
+        const traffic = segmentContext?.traffic || {};
+        const name = location?.name ? escapeHtml(location.name) : `Location ${escapeHtml(location?.id ?? '')}`;
+        const category = escapeHtml(location?.semantic_category || 'other');
+        const relevance = Number(location?.relevance_score ?? 0).toFixed(3);
+        const dist = Number(location?.distance_to_route_km ?? 0).toFixed(3);
+        const detour = Number(location?.estimated_detour_km ?? 0).toFixed(3);
+        const eta = segmentContext?.eta_utc ? escapeHtml(segmentContext.eta_utc) : 'n/a';
+        const weatherSummary = weather?.status === 'observed'
+          ? `${escapeHtml(weather.condition || 'n/a')}, ${escapeHtml(weather.temperature_c ?? 'n/a')} C`
+          : 'unknown';
+        const trafficSummary = traffic?.status === 'observed'
+          ? `congestion ${escapeHtml(traffic.congestion_level || 'n/a')}, speed ${escapeHtml(traffic.speed_kmh ?? 'n/a')} km/h`
+          : 'unknown';
+
+        return `
+          <div class="semantic-popup">
+            <h4>&bull; ${name}</h4>
+            <div><strong>Route:</strong> Vehicle ${escapeHtml(vehicle ?? '?')}</div>
+            <div><strong>Category:</strong> ${category}</div>
+            <div><strong>Relevance:</strong> ${relevance}</div>
+            <div><strong>Distance to route:</strong> ${dist} km</div>
+            <div><strong>Estimated detour:</strong> ${detour} km</div>
+            <div><strong>Segment ETA:</strong> ${eta}</div>
+            <div><strong>Weather:</strong> ${weatherSummary}</div>
+            <div><strong>Traffic:</strong> ${trafficSummary}</div>
+            <div class="muted">Lat/Lng: ${escapeHtml(location.lat)}, ${escapeHtml(location.lng)}</div>
+          </div>
+        `;
+      }
+
+      function segmentPopupHtml(vehicle, segmentContext) {
+        const weather = segmentContext?.weather || {};
+        const traffic = segmentContext?.traffic || {};
+        const eta = segmentContext?.eta_utc ? escapeHtml(segmentContext.eta_utc) : 'n/a';
+        const distance = Number(segmentContext?.distance_km ?? 0).toFixed(3);
+        const weatherSummary = weather?.status === 'observed'
+          ? `${escapeHtml(weather.condition || 'n/a')}, ${escapeHtml(weather.temperature_c ?? 'n/a')} C`
+          : 'unknown';
+        const trafficSummary = traffic?.status === 'observed'
+          ? `congestion ${escapeHtml(traffic.congestion_level || 'n/a')}, speed ${escapeHtml(traffic.speed_kmh ?? 'n/a')} km/h`
+          : 'unknown';
+
+        return `
+          <div class="semantic-popup">
+            <h4>&bull; Segment context</h4>
+            <div><strong>Route:</strong> Vehicle ${escapeHtml(vehicle ?? '?')}</div>
+            <div><strong>Segment:</strong> #${escapeHtml((segmentContext?.segment_index ?? 0) + 1)}</div>
+            <div><strong>Segment distance:</strong> ${distance} km</div>
+            <div><strong>ETA:</strong> ${eta}</div>
+            <div><strong>Weather:</strong> ${weatherSummary}</div>
+            <div><strong>Traffic:</strong> ${trafficSummary}</div>
+            <div class="muted">No semantic POI matched in this corridor window.</div>
+          </div>
+        `;
+      }
+
+      function renderSemanticAnchors(data) {
+        semanticMarkers.forEach(m => map.removeLayer(m));
+        semanticMarkers = [];
+
+        const semanticRoutes = data?.semantic_layer?.routes;
+        if (!Array.isArray(semanticRoutes)) {
+          return;
+        }
+
+        for (const routeSemantic of semanticRoutes) {
+          const vehicle = routeSemantic?.vehicle;
+          const color = colors[((Number(vehicle) || 1) - 1) % colors.length];
+          const semanticLocations = Array.isArray(routeSemantic?.semantic_locations)
+            ? routeSemantic.semantic_locations
+            : [];
+          const segmentContext = Array.isArray(routeSemantic?.segment_context)
+            ? routeSemantic.segment_context
+            : [];
+
+          for (const location of semanticLocations) {
+            if (typeof location?.lat !== 'number' || typeof location?.lng !== 'number') {
+              continue;
+            }
+
+            const linkedSegment = pickSegmentContext(routeSemantic, location.nearest_segment_index);
+            const popupHtml = semanticPopupHtml(vehicle, location, linkedSegment);
+            const icon = L.divIcon({
+              className: 'semantic-anchor-shell',
+              html: `<div class="semantic-anchor-icon" style="border-color:${color};color:${color};background:#d6e7ff;">&bull;</div>`,
+              iconSize: [16, 16],
+              iconAnchor: [8, 8],
+              popupAnchor: [0, -10]
+            });
+
+            const marker = L.marker([location.lat, location.lng], { icon }).addTo(map);
+            marker.bindPopup(popupHtml, { maxWidth: 310 });
+            semanticMarkers.push(marker);
+          }
+
+          if (semanticLocations.length === 0 && segmentContext.length > 0) {
+            const sampledSegments = segmentContext
+              .filter((segment, index) => index % 2 === 0)
+              .slice(0, 12);
+
+            for (const segment of sampledSegments) {
+              const midpoint = segment?.midpoint;
+              if (typeof midpoint?.lat !== 'number' || typeof midpoint?.lng !== 'number') {
+                continue;
+              }
+
+              const popupHtml = segmentPopupHtml(vehicle, segment);
+              const icon = L.divIcon({
+                className: 'semantic-anchor-shell',
+                html: `<div class="semantic-segment-icon" style="border-color:${color};"></div>`,
+                iconSize: [12, 12],
+                iconAnchor: [6, 6],
+                popupAnchor: [0, -8]
+              });
+
+              const marker = L.marker([midpoint.lat, midpoint.lng], { icon }).addTo(map);
+              marker.bindPopup(popupHtml, { maxWidth: 300 });
+              semanticMarkers.push(marker);
+            }
+          }
+        }
       }
 
       async function fetchOsrmRoadGeometry(stops) {
@@ -210,6 +439,7 @@ HTML_PAGE = """
           const line = L.polyline(latlngs, { color: colors[idx % colors.length], weight: 4 }).addTo(map);
           routeLayers.push(line);
         }));
+        renderSemanticAnchors(data);
       });
     </script>
   </body>
@@ -258,6 +488,10 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=502,
         )
+
+    if _as_bool(payload.get("include_semantic_layer"), True):
+        result["semantic_layer"] = build_semantic_layer(result, payload)
+
     return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
 
 
