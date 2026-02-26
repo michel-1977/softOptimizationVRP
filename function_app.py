@@ -309,16 +309,16 @@ HTML_PAGE = """
       <div class="row">
         <label>Distance calculation</label>
         <select id="distanceMode">
-          <option value="direct" selected>Direct (Haversine)</option>
-          <option value="osrm">Real road kms (OSRM)</option>
+          <option value="direct">Direct (Haversine)</option>
+          <option value="osrm" selected>Real road kms (OSRM)</option>
         </select>
       </div>
 
       <div class="row">
         <label>HERE data source</label>
         <select id="hereDataSource">
-          <option value="here" selected>Live HERE APIs</option>
-          <option value="emulator">HERE emulator (randomized)</option>
+          <option value="here">Live HERE APIs</option>
+          <option value="emulator" selected>HERE emulator (randomized)</option>
         </select>
       </div>
 
@@ -344,8 +344,10 @@ HTML_PAGE = """
 
       <div class="row" style="display:flex; gap:8px;">
         <button id="solveBtn">Solve VRP</button>
+        <button id="municipalityBtn" disabled>Add Municipality Trace</button>
         <button id="clearBtn">Clear</button>
       </div>
+      <div class="small">Run VRP first, then click "Add Municipality Trace" to enrich segments using OSM.</div>
       <div class="row">
         <button id="autogenBtn" type="button">Autogenerate VRP Problem</button>
         <div class="small">Loads your 1 depot + 9 customers reference scenario.</div>
@@ -378,6 +380,7 @@ HTML_PAGE = """
       let routeLayers = [];
       let semanticMarkers = [];
       let customerId = 1;
+      let lastSolvePayload = null;
       const OSRM_PUBLIC_BASE_URL = 'https://router.project-osrm.org';
 
       const colors = ['#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#a65628'];
@@ -402,6 +405,12 @@ HTML_PAGE = """
         routeLayers = [];
         semanticMarkers.forEach(m => map.removeLayer(m));
         semanticMarkers = [];
+      }
+
+      function setMunicipalityButtonState(enabled, busy = false) {
+        const municipalityBtn = document.getElementById('municipalityBtn');
+        municipalityBtn.disabled = !enabled || busy;
+        municipalityBtn.textContent = busy ? 'Tracing municipalities...' : 'Add Municipality Trace';
       }
 
       function escapeHtml(value) {
@@ -452,6 +461,53 @@ HTML_PAGE = """
         return `ratio ${escapeHtml(ratio)} (+${escapeHtml(delay)}s) at ${escapeHtml(labels || 'n/a')}`;
       }
 
+      function municipalityOutputNotice(data) {
+        const semantic = data?.semantic_layer || {};
+        const explicit = semantic?.municipality_post_output_notice;
+        if (typeof explicit === 'string' && explicit.trim().length > 0) {
+          return explicit.trim();
+        }
+
+        const routeGeometry = semantic?.municipality_api?.route_geometry || {};
+        const fallbackToStraight = Number(
+          routeGeometry?.fallback_to_straight
+          ?? semantic?.summary?.municipality_route_geometry_fallback_to_straight
+          ?? 0
+        );
+        const phase1Unknown = Number(semantic?.municipality_api?.phase1?.unknown ?? 0);
+        const phase1Failed = Number(semantic?.municipality_api?.phase1?.failed ?? 0);
+        const status = String(semantic?.municipality_api?.status || '').trim().toLowerCase();
+        const warnings = [];
+
+        if (fallbackToStraight > 0) {
+          warnings.push(
+            `WARNING: Municipality tracing used straight-line fallback in ${fallbackToStraight} segment(s).`
+          );
+        }
+        if (phase1Unknown > 0 || phase1Failed > 0) {
+          warnings.push(
+            `WARNING: Municipality phase 1 unresolved coordinates (unknown=${phase1Unknown}, failed=${phase1Failed}).`
+          );
+        }
+        if (status && status !== 'ok') {
+          warnings.push(`WARNING: Municipality API status is '${status}'.`);
+        }
+        if (warnings.length === 0) {
+          return 'Municipality fallback warning: none.';
+        }
+        return warnings.join(' | ');
+      }
+
+      function municipalityVectorLabel(segmentContext) {
+        const names = Array.isArray(segmentContext?.municipality_names)
+          ? segmentContext.municipality_names.filter(name => typeof name === 'string' && name.trim().length > 0)
+          : [];
+        if (names.length === 0) {
+          return 'n/a';
+        }
+        return names.map(name => escapeHtml(name)).join(' -> ');
+      }
+
       function semanticPopupHtml(vehicle, location, segmentContext) {
         const weather = segmentContext?.weather || {};
         const traffic = segmentContext?.traffic || {};
@@ -469,6 +525,7 @@ HTML_PAGE = """
           : 'unknown';
         const weatherForecastSummary = summarizeWeatherForecast(weather);
         const trafficForecastSummary = summarizeTrafficForecast(traffic);
+        const municipalityVector = municipalityVectorLabel(segmentContext);
 
         return `
           <div class="semantic-popup">
@@ -483,6 +540,7 @@ HTML_PAGE = """
             <div><strong>Weather 24h worst:</strong> ${weatherForecastSummary}</div>
             <div><strong>Traffic:</strong> ${trafficSummary}</div>
             <div><strong>Traffic 24h worst:</strong> ${trafficForecastSummary}</div>
+            <div><strong>Municipalities (start->end):</strong> ${municipalityVector}</div>
             <div class="muted">Lat/Lng: ${escapeHtml(location.lat)}, ${escapeHtml(location.lng)}</div>
           </div>
         `;
@@ -501,6 +559,7 @@ HTML_PAGE = """
           : 'unknown';
         const weatherForecastSummary = summarizeWeatherForecast(weather);
         const trafficForecastSummary = summarizeTrafficForecast(traffic);
+        const municipalityVector = municipalityVectorLabel(segmentContext);
 
         return `
           <div class="semantic-popup">
@@ -513,6 +572,7 @@ HTML_PAGE = """
             <div><strong>Weather 24h worst:</strong> ${weatherForecastSummary}</div>
             <div><strong>Traffic:</strong> ${trafficSummary}</div>
             <div><strong>Traffic 24h worst:</strong> ${trafficForecastSummary}</div>
+            <div><strong>Municipalities (start->end):</strong> ${municipalityVector}</div>
             <div class="muted">No semantic POI matched in this corridor window.</div>
           </div>
         `;
@@ -611,6 +671,43 @@ HTML_PAGE = """
         }
       }
 
+      async function solveAndRender(payload) {
+        const resp = await fetch('/solve_vrp', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+          let message = 'Error solving VRP';
+          try {
+            const errData = await resp.json();
+            message = errData.error || message;
+          } catch (_) {}
+          throw new Error(message);
+        }
+
+        const data = await resp.json();
+        const jsonOutput = JSON.stringify(data, null, 2);
+        const fallbackNotice = municipalityOutputNotice(data);
+        document.getElementById('output').textContent = `${jsonOutput}\n\n${fallbackNotice}`;
+
+        clearRoutes();
+        await Promise.all(data.routes.map(async (r, idx) => {
+          let latlngs = r.stops.map(s => [s.lat, s.lng]);
+          if (payload.distance_mode === 'osrm') {
+            const roadLatLngs = await fetchOsrmRoadGeometry(r.stops);
+            if (roadLatLngs) {
+              latlngs = roadLatLngs;
+            }
+          }
+          const line = L.polyline(latlngs, { color: colors[idx % colors.length], weight: 4 }).addTo(map);
+          routeLayers.push(line);
+        }));
+        renderSemanticAnchors(data);
+        return data;
+      }
+
       map.on('click', (e) => {
         const mode = document.getElementById('mode').value;
         if (mode === 'depot') {
@@ -626,6 +723,8 @@ HTML_PAGE = """
         depot = null;
         customers = [];
         customerId = 1;
+        lastSolvePayload = null;
+        setMunicipalityButtonState(false);
         clearRoutes();
         redrawPoints();
         document.getElementById('output').textContent = 'Waiting for data...';
@@ -645,6 +744,8 @@ HTML_PAGE = """
           { id: 9, lat: 37.54457732085584, lng: -2.3291015625000004, demand: 2 }
         ];
         customerId = 10;
+        lastSolvePayload = null;
+        setMunicipalityButtonState(false);
 
         document.getElementById('vehicles').value = 5;
         document.getElementById('capacity').value = 5;
@@ -676,45 +777,50 @@ HTML_PAGE = """
           departure_time_utc: new Date().toISOString(),
           here_pipeline_mode: document.getElementById('hereMode').value,
           here_data_source: document.getElementById('hereDataSource').value,
-          use_here_platform: true
+          use_here_platform: true,
+          municipality_enrichment_enabled: false
         };
 
         payload.here_forecast_window_hours = 24;
         payload.here_forecast_interval_min = Math.max(30, parseInt(document.getElementById('hereForecastInterval').value || '120', 10));
         payload.here_traffic_radius_m = Math.max(50, parseInt(document.getElementById('hereTrafficRadius').value || '300', 10));
 
-        const resp = await fetch('/solve_vrp', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(payload)
-        });
+        setMunicipalityButtonState(false);
+        document.getElementById('output').textContent = 'Solving VRP + HERE enrichment...';
+        try {
+          await solveAndRender(payload);
+          lastSolvePayload = payload;
+          setMunicipalityButtonState(true);
+        } catch (err) {
+          document.getElementById('output').textContent = err.message || 'Error solving VRP';
+          lastSolvePayload = null;
+          setMunicipalityButtonState(false);
+        }
+      });
 
-        if (!resp.ok) {
-          let message = 'Error solving VRP';
-          try {
-            const errData = await resp.json();
-            message = errData.error || message;
-          } catch (_) {}
-          document.getElementById('output').textContent = message;
+      document.getElementById('municipalityBtn').addEventListener('click', async () => {
+        if (!lastSolvePayload) {
+          alert('Run Solve VRP first.');
           return;
         }
-
-        const data = await resp.json();
-        document.getElementById('output').textContent = JSON.stringify(data, null, 2);
-
-        clearRoutes();
-        await Promise.all(data.routes.map(async (r, idx) => {
-          let latlngs = r.stops.map(s => [s.lat, s.lng]);
-          if (payload.distance_mode === 'osrm') {
-            const roadLatLngs = await fetchOsrmRoadGeometry(r.stops);
-            if (roadLatLngs) {
-              latlngs = roadLatLngs;
-            }
-          }
-          const line = L.polyline(latlngs, { color: colors[idx % colors.length], weight: 4 }).addTo(map);
-          routeLayers.push(line);
-        }));
-        renderSemanticAnchors(data);
+        const payload = {
+          ...lastSolvePayload,
+          departure_time_utc: new Date().toISOString(),
+          municipality_enrichment_enabled: true
+        };
+        setMunicipalityButtonState(true, true);
+        document.getElementById('output').textContent = 'Computing municipality trace with OSM...';
+        try {
+          await solveAndRender(payload);
+          lastSolvePayload = {
+            ...lastSolvePayload,
+            municipality_enrichment_enabled: true
+          };
+          setMunicipalityButtonState(true);
+        } catch (err) {
+          document.getElementById('output').textContent = err.message || 'Error computing municipality trace';
+          setMunicipalityButtonState(true);
+        }
       });
     </script>
   </body>

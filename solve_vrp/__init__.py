@@ -2,6 +2,7 @@ import math
 import urllib.parse
 import urllib.request
 import json
+import time
 from typing import Dict, List, Optional, Tuple
 
 
@@ -70,6 +71,13 @@ class Route:
 def build_distance_matrix_km(
     points: List[Dict], distance_mode: str, osrm_base_url: str
 ) -> List[List[float]]:
+    matrix, _ = _build_distance_matrix_km_with_meta(points, distance_mode, osrm_base_url)
+    return matrix
+
+
+def _build_distance_matrix_km_with_meta(
+    points: List[Dict], distance_mode: str, osrm_base_url: str
+) -> Tuple[List[List[float]], Dict[str, Optional[str]]]:
     if distance_mode == "direct":
         return [
             [
@@ -77,21 +85,49 @@ def build_distance_matrix_km(
                 for b in points
             ]
             for a in points
-        ]
+        ], {"distance_source": "direct", "warning": None}
 
     coords = ";".join(f"{p['lng']},{p['lat']}" for p in points)
     encoded_coords = urllib.parse.quote(coords, safe=";,")
     base = osrm_base_url.rstrip("/")
     url = f"{base}/table/v1/driving/{encoded_coords}?annotations=distance"
 
-    try:
-        with urllib.request.urlopen(url, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"Failed to query OSRM table API: {exc}") from exc
+    data = None
+    last_exc = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=25) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(0.35 * (attempt + 1))
+
+    if data is None:
+        # Keep the solve path available even when public OSRM is overloaded.
+        return [
+            [
+                haversine_km((a["lat"], a["lng"]), (b["lat"], b["lng"]))
+                for b in points
+            ]
+            for a in points
+        ], {
+            "distance_source": "direct_fallback",
+            "warning": f"OSRM table unavailable, using direct distances. Reason: {last_exc}",
+        }
 
     if data.get("code") != "Ok" or "distances" not in data:
-        raise RuntimeError("OSRM did not return a valid distance matrix.")
+        return [
+            [
+                haversine_km((a["lat"], a["lng"]), (b["lat"], b["lng"]))
+                for b in points
+            ]
+            for a in points
+        ], {
+            "distance_source": "direct_fallback",
+            "warning": "OSRM returned invalid table payload, using direct distances.",
+        }
 
     matrix_m = data["distances"]
     matrix_km = []
@@ -99,7 +135,7 @@ def build_distance_matrix_km(
         matrix_km.append(
             [float("inf") if value is None else float(value) / 1000.0 for value in row]
         )
-    return matrix_km
+    return matrix_km, {"distance_source": "osrm", "warning": None}
 
 
 def route_distance_from_matrix_km(
@@ -293,6 +329,8 @@ def solve_vrp_nearest_neighbor(
 ) -> Dict:
     if distance_mode not in {"direct", "osrm"}:
         raise RuntimeError("distance_mode must be either 'direct' or 'osrm'.")
+    warnings: List[str] = []
+    distance_source = "direct" if distance_mode == "direct" else "osrm"
 
     eligible_customers = [
         dict(customer)
@@ -303,7 +341,13 @@ def solve_vrp_nearest_neighbor(
     idx_by_id = {point["id"]: idx for idx, point in enumerate(points)}
 
     if len(points) > 1:
-        distance_matrix_km = build_distance_matrix_km(points, distance_mode, osrm_base_url)
+        distance_matrix_km, matrix_meta = _build_distance_matrix_km_with_meta(
+            points, distance_mode, osrm_base_url
+        )
+        distance_source = matrix_meta.get("distance_source") or distance_source
+        warning = matrix_meta.get("warning")
+        if warning:
+            warnings.append(str(warning))
     else:
         distance_matrix_km = [[0.0]]
 
@@ -319,9 +363,13 @@ def solve_vrp_nearest_neighbor(
         points = [dict(depot)] + reachable_customers
         idx_by_id = {point["id"]: idx for idx, point in enumerate(points)}
         if len(points) > 1:
-            distance_matrix_km = build_distance_matrix_km(
+            distance_matrix_km, matrix_meta = _build_distance_matrix_km_with_meta(
                 points, distance_mode, osrm_base_url
             )
+            distance_source = matrix_meta.get("distance_source") or distance_source
+            warning = matrix_meta.get("warning")
+            if warning:
+                warnings.append(str(warning))
         else:
             distance_matrix_km = [[0.0]]
 
@@ -386,11 +434,13 @@ def solve_vrp_nearest_neighbor(
     return {
         "routes": routes,
         "unserved_customer_ids": unserved,
+        "warnings": warnings[:5],
         "summary": {
             "vehicles": vehicles,
             "customers": len(customers),
             "served": len(customers) - len(unserved),
             "unserved": len(unserved),
             "total_distance_km": total_distance,
+            "distance_source": distance_source,
         },
     }
