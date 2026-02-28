@@ -381,22 +381,73 @@ HTML_PAGE = """
       let semanticMarkers = [];
       let customerId = 1;
       let lastSolvePayload = null;
+      let lastSolveResult = null;
+      let phase1PointByCoord = new Map();
       const OSRM_PUBLIC_BASE_URL = 'https://router.project-osrm.org';
 
       const colors = ['#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#a65628'];
+
+      function coordKey(lat, lng) {
+        return `${Number(lat).toFixed(6)},${Number(lng).toFixed(6)}`;
+      }
+
+      function pointAdminLabel(value) {
+        const text = String(value ?? '').trim();
+        return text.length > 0 ? escapeHtml(text) : 'n/a';
+      }
+
+      function depotPopupHtml() {
+        const info = depot ? phase1PointByCoord.get(coordKey(depot.lat, depot.lng)) : null;
+        return `
+          <div class="semantic-popup">
+            <h4>&bull; Depot</h4>
+            <div><strong>Municipality:</strong> ${pointAdminLabel(info?.municipality_name)}</div>
+            <div><strong>Province:</strong> ${pointAdminLabel(info?.province_name)}</div>
+            <div><strong>Province capital:</strong> ${pointAdminLabel(info?.province_capital_name)}</div>
+            <div><strong>Status:</strong> ${pointAdminLabel(info?.status)}</div>
+            <div class="muted">Lat/Lng: ${escapeHtml(depot?.lat)}, ${escapeHtml(depot?.lng)}</div>
+          </div>
+        `;
+      }
+
+      function customerPopupHtml(customer) {
+        const info = customer ? phase1PointByCoord.get(coordKey(customer.lat, customer.lng)) : null;
+        return `
+          <div class="semantic-popup">
+            <h4>&bull; Customer ${escapeHtml(customer?.id)}</h4>
+            <div><strong>Demand:</strong> ${escapeHtml(customer?.demand)}</div>
+            <div><strong>Municipality:</strong> ${pointAdminLabel(info?.municipality_name)}</div>
+            <div><strong>Province:</strong> ${pointAdminLabel(info?.province_name)}</div>
+            <div><strong>Province capital:</strong> ${pointAdminLabel(info?.province_capital_name)}</div>
+            <div><strong>Status:</strong> ${pointAdminLabel(info?.status)}</div>
+            <div class="muted">Lat/Lng: ${escapeHtml(customer?.lat)}, ${escapeHtml(customer?.lng)}</div>
+          </div>
+        `;
+      }
 
       function redrawPoints() {
         markers.forEach(m => map.removeLayer(m));
         markers = [];
 
         if (depot) {
-          markers.push(L.marker([depot.lat, depot.lng], {title:'Depot'}).addTo(map).bindPopup('Depot'));
+          markers.push(
+            L.marker([depot.lat, depot.lng], { title: 'Depot' })
+              .addTo(map)
+              .bindPopup(depotPopupHtml(), { maxWidth: 320 })
+          );
         }
 
         for (const c of customers) {
-          markers.push(L.circleMarker([c.lat, c.lng], {radius:8, color:'#222', fillColor:'#ffd54f', fillOpacity:0.95})
-            .addTo(map)
-            .bindPopup(`Customer ${c.id} | Demand: ${c.demand}`));
+          markers.push(
+            L.circleMarker([c.lat, c.lng], {
+              radius: 8,
+              color: '#222',
+              fillColor: '#ffd54f',
+              fillOpacity: 0.95
+            })
+              .addTo(map)
+              .bindPopup(customerPopupHtml(c), { maxWidth: 320 })
+          );
         }
       }
 
@@ -498,9 +549,9 @@ HTML_PAGE = """
         return warnings.join(' | ');
       }
 
-      function municipalityVectorLabel(segmentContext) {
-        const names = Array.isArray(segmentContext?.municipality_names)
-          ? segmentContext.municipality_names.filter(name => typeof name === 'string' && name.trim().length > 0)
+      function orderedVectorLabel(items) {
+        const names = Array.isArray(items)
+          ? items.filter(name => typeof name === 'string' && name.trim().length > 0)
           : [];
         if (names.length === 0) {
           return 'n/a';
@@ -508,7 +559,24 @@ HTML_PAGE = """
         return names.map(name => escapeHtml(name)).join(' -> ');
       }
 
-      function semanticPopupHtml(vehicle, location, segmentContext) {
+      function segmentVectors(segmentContext) {
+        return {
+          province: orderedVectorLabel(segmentContext?.province_names),
+          provinceCapital: orderedVectorLabel(segmentContext?.province_capital_names),
+          municipality: orderedVectorLabel(segmentContext?.municipality_names)
+        };
+      }
+
+      function routeVectors(routeSemantic) {
+        return {
+          province: orderedVectorLabel(routeSemantic?.province_vector),
+          provinceCapital: orderedVectorLabel(routeSemantic?.province_capital_vector),
+          municipality: orderedVectorLabel(routeSemantic?.municipality_vector)
+        };
+      }
+
+      function semanticPopupHtml(routeSemantic, location, segmentContext) {
+        const vehicle = routeSemantic?.vehicle;
         const weather = segmentContext?.weather || {};
         const traffic = segmentContext?.traffic || {};
         const name = location?.name ? escapeHtml(location.name) : `Location ${escapeHtml(location?.id ?? '')}`;
@@ -525,7 +593,8 @@ HTML_PAGE = """
           : 'unknown';
         const weatherForecastSummary = summarizeWeatherForecast(weather);
         const trafficForecastSummary = summarizeTrafficForecast(traffic);
-        const municipalityVector = municipalityVectorLabel(segmentContext);
+        const segmentVector = segmentVectors(segmentContext);
+        const routeVector = routeVectors(routeSemantic);
 
         return `
           <div class="semantic-popup">
@@ -540,13 +609,19 @@ HTML_PAGE = """
             <div><strong>Weather 24h worst:</strong> ${weatherForecastSummary}</div>
             <div><strong>Traffic:</strong> ${trafficSummary}</div>
             <div><strong>Traffic 24h worst:</strong> ${trafficForecastSummary}</div>
-            <div><strong>Municipalities (start->end):</strong> ${municipalityVector}</div>
+            <div><strong>Segment province vector:</strong> ${segmentVector.province}</div>
+            <div><strong>Segment province capital vector:</strong> ${segmentVector.provinceCapital}</div>
+            <div><strong>Segment municipality vector:</strong> ${segmentVector.municipality}</div>
+            <div class="muted"><strong>Route province vector:</strong> ${routeVector.province}</div>
+            <div class="muted"><strong>Route province capital vector:</strong> ${routeVector.provinceCapital}</div>
+            <div class="muted"><strong>Route municipality vector:</strong> ${routeVector.municipality}</div>
             <div class="muted">Lat/Lng: ${escapeHtml(location.lat)}, ${escapeHtml(location.lng)}</div>
           </div>
         `;
       }
 
-      function segmentPopupHtml(vehicle, segmentContext) {
+      function segmentPopupHtml(routeSemantic, segmentContext) {
+        const vehicle = routeSemantic?.vehicle;
         const weather = segmentContext?.weather || {};
         const traffic = segmentContext?.traffic || {};
         const eta = segmentContext?.eta_utc ? escapeHtml(segmentContext.eta_utc) : 'n/a';
@@ -559,7 +634,8 @@ HTML_PAGE = """
           : 'unknown';
         const weatherForecastSummary = summarizeWeatherForecast(weather);
         const trafficForecastSummary = summarizeTrafficForecast(traffic);
-        const municipalityVector = municipalityVectorLabel(segmentContext);
+        const segmentVector = segmentVectors(segmentContext);
+        const routeVector = routeVectors(routeSemantic);
 
         return `
           <div class="semantic-popup">
@@ -572,7 +648,12 @@ HTML_PAGE = """
             <div><strong>Weather 24h worst:</strong> ${weatherForecastSummary}</div>
             <div><strong>Traffic:</strong> ${trafficSummary}</div>
             <div><strong>Traffic 24h worst:</strong> ${trafficForecastSummary}</div>
-            <div><strong>Municipalities (start->end):</strong> ${municipalityVector}</div>
+            <div><strong>Segment province vector:</strong> ${segmentVector.province}</div>
+            <div><strong>Segment province capital vector:</strong> ${segmentVector.provinceCapital}</div>
+            <div><strong>Segment municipality vector:</strong> ${segmentVector.municipality}</div>
+            <div class="muted"><strong>Route province vector:</strong> ${routeVector.province}</div>
+            <div class="muted"><strong>Route province capital vector:</strong> ${routeVector.provinceCapital}</div>
+            <div class="muted"><strong>Route municipality vector:</strong> ${routeVector.municipality}</div>
             <div class="muted">No semantic POI matched in this corridor window.</div>
           </div>
         `;
@@ -603,7 +684,7 @@ HTML_PAGE = """
             }
 
             const linkedSegment = pickSegmentContext(routeSemantic, location.nearest_segment_index);
-            const popupHtml = semanticPopupHtml(vehicle, location, linkedSegment);
+            const popupHtml = semanticPopupHtml(routeSemantic, location, linkedSegment);
             const icon = L.divIcon({
               className: 'semantic-anchor-shell',
               html: `<div class="semantic-anchor-icon" style="border-color:${color};color:${color};background:#d6e7ff;">&bull;</div>`,
@@ -630,7 +711,7 @@ HTML_PAGE = """
                 continue;
               }
 
-              const popupHtml = segmentPopupHtml(vehicle, segment);
+              const popupHtml = segmentPopupHtml(routeSemantic, segment);
               const icon = L.divIcon({
                 className: 'semantic-anchor-shell',
                 html: `<div class="semantic-segment-icon" style="border-color:${color};"></div>`,
@@ -671,26 +752,45 @@ HTML_PAGE = """
         }
       }
 
-      async function solveAndRender(payload) {
-        const resp = await fetch('/solve_vrp', {
+      async function requestJson(url, body, defaultErrorMessage) {
+        const resp = await fetch(url, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(payload)
+          body: JSON.stringify(body)
         });
 
         if (!resp.ok) {
-          let message = 'Error solving VRP';
+          let message = defaultErrorMessage;
           try {
             const errData = await resp.json();
             message = errData.error || message;
           } catch (_) {}
           throw new Error(message);
         }
+        return resp.json();
+      }
 
-        const data = await resp.json();
+      function applyPhase1InputPoints(data) {
+        phase1PointByCoord = new Map();
+        const points = Array.isArray(data?.semantic_layer?.municipality_phase1_input_points)
+          ? data.semantic_layer.municipality_phase1_input_points
+          : [];
+        for (const row of points) {
+          const key = typeof row?.coord_key === 'string' && row.coord_key.trim().length > 0
+            ? row.coord_key.trim()
+            : coordKey(row?.lat, row?.lng);
+          if (typeof key === 'string' && key.length > 0) {
+            phase1PointByCoord.set(key, row);
+          }
+        }
+      }
+
+      async function renderResult(data, payload) {
         const jsonOutput = JSON.stringify(data, null, 2);
         const fallbackNotice = municipalityOutputNotice(data);
         document.getElementById('output').textContent = `${jsonOutput}\n\n${fallbackNotice}`;
+        applyPhase1InputPoints(data);
+        redrawPoints();
 
         clearRoutes();
         await Promise.all(data.routes.map(async (r, idx) => {
@@ -708,7 +808,22 @@ HTML_PAGE = """
         return data;
       }
 
+      async function solveAndRender(payload) {
+        const data = await requestJson('/solve_vrp', payload, 'Error solving VRP');
+        return renderResult(data, payload);
+      }
+
+      async function enrichMunicipalityAndRender(payload, vrpResult) {
+        const data = await requestJson(
+          '/enrich_municipality',
+          { payload, vrp_result: vrpResult },
+          'Error computing municipality trace'
+        );
+        return renderResult(data, payload);
+      }
+
       map.on('click', (e) => {
+        phase1PointByCoord = new Map();
         const mode = document.getElementById('mode').value;
         if (mode === 'depot') {
           depot = { lat: e.latlng.lat, lng: e.latlng.lng, id: 'depot' };
@@ -724,6 +839,8 @@ HTML_PAGE = """
         customers = [];
         customerId = 1;
         lastSolvePayload = null;
+        lastSolveResult = null;
+        phase1PointByCoord = new Map();
         setMunicipalityButtonState(false);
         clearRoutes();
         redrawPoints();
@@ -745,6 +862,8 @@ HTML_PAGE = """
         ];
         customerId = 10;
         lastSolvePayload = null;
+        lastSolveResult = null;
+        phase1PointByCoord = new Map();
         setMunicipalityButtonState(false);
 
         document.getElementById('vehicles').value = 5;
@@ -785,21 +904,24 @@ HTML_PAGE = """
         payload.here_forecast_interval_min = Math.max(30, parseInt(document.getElementById('hereForecastInterval').value || '120', 10));
         payload.here_traffic_radius_m = Math.max(50, parseInt(document.getElementById('hereTrafficRadius').value || '300', 10));
 
+        phase1PointByCoord = new Map();
         setMunicipalityButtonState(false);
         document.getElementById('output').textContent = 'Solving VRP + HERE enrichment...';
         try {
-          await solveAndRender(payload);
+          const data = await solveAndRender(payload);
           lastSolvePayload = payload;
+          lastSolveResult = data;
           setMunicipalityButtonState(true);
         } catch (err) {
           document.getElementById('output').textContent = err.message || 'Error solving VRP';
           lastSolvePayload = null;
+          lastSolveResult = null;
           setMunicipalityButtonState(false);
         }
       });
 
       document.getElementById('municipalityBtn').addEventListener('click', async () => {
-        if (!lastSolvePayload) {
+        if (!lastSolvePayload || !lastSolveResult) {
           alert('Run Solve VRP first.');
           return;
         }
@@ -811,11 +933,12 @@ HTML_PAGE = """
         setMunicipalityButtonState(true, true);
         document.getElementById('output').textContent = 'Computing municipality trace with OSM...';
         try {
-          await solveAndRender(payload);
+          const data = await enrichMunicipalityAndRender(payload, lastSolveResult);
           lastSolvePayload = {
             ...lastSolvePayload,
             municipality_enrichment_enabled: true
           };
+          lastSolveResult = data;
           setMunicipalityButtonState(true);
         } catch (err) {
           document.getElementById('output').textContent = err.message || 'Error computing municipality trace';
@@ -909,6 +1032,219 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
 
 
+def _merge_municipality_semantic(
+    base_semantic: dict, municipality_semantic: dict
+) -> dict:
+    merged = dict(base_semantic)
+
+    base_config = (
+        dict(base_semantic.get("config", {}))
+        if isinstance(base_semantic.get("config"), dict)
+        else {}
+    )
+    municipality_config = (
+        municipality_semantic.get("config", {})
+        if isinstance(municipality_semantic.get("config"), dict)
+        else {}
+    )
+    for key, value in municipality_config.items():
+        if (
+            str(key).startswith("municipality_")
+            or str(key).startswith("province_")
+            or key in {"distance_mode", "distance_source"}
+        ):
+            base_config[key] = value
+    if base_config:
+        merged["config"] = base_config
+
+    base_summary = (
+        dict(base_semantic.get("summary", {}))
+        if isinstance(base_semantic.get("summary"), dict)
+        else {}
+    )
+    municipality_summary = (
+        municipality_semantic.get("summary", {})
+        if isinstance(municipality_semantic.get("summary"), dict)
+        else {}
+    )
+    for key, value in municipality_summary.items():
+        if str(key).startswith("municipality_") or str(key).startswith("province_"):
+            base_summary[key] = value
+    if base_summary:
+        merged["summary"] = base_summary
+
+    for key in (
+        "municipality_api",
+        "municipality_address_book",
+        "municipality_phase1_input_points",
+        "municipality_post_output_notice",
+        "municipality_post_output_warnings",
+    ):
+        if key in municipality_semantic:
+            merged[key] = municipality_semantic[key]
+
+    merged["version"] = municipality_semantic.get(
+        "version", base_semantic.get("version")
+    )
+    merged["generated_at_utc"] = municipality_semantic.get(
+        "generated_at_utc", base_semantic.get("generated_at_utc")
+    )
+
+    base_errors = (
+        list(base_semantic.get("errors", []))
+        if isinstance(base_semantic.get("errors"), list)
+        else []
+    )
+    municipality_errors = (
+        list(municipality_semantic.get("errors", []))
+        if isinstance(municipality_semantic.get("errors"), list)
+        else []
+    )
+    merged["errors"] = (base_errors + municipality_errors)[:40]
+
+    base_routes = (
+        base_semantic.get("routes", [])
+        if isinstance(base_semantic.get("routes"), list)
+        else []
+    )
+    municipality_routes = (
+        municipality_semantic.get("routes", [])
+        if isinstance(municipality_semantic.get("routes"), list)
+        else []
+    )
+    municipality_by_vehicle = {
+        str(route.get("vehicle")): route
+        for route in municipality_routes
+        if isinstance(route, dict)
+    }
+
+    merged_routes = []
+    for base_route in base_routes:
+        if not isinstance(base_route, dict):
+            continue
+        route = dict(base_route)
+        municipality_route = municipality_by_vehicle.get(str(base_route.get("vehicle")))
+        if not isinstance(municipality_route, dict):
+            merged_routes.append(route)
+            continue
+
+        if isinstance(municipality_route.get("stop_municipality_links"), list):
+            route["stop_municipality_links"] = municipality_route["stop_municipality_links"]
+        for key in ("province_vector", "province_capital_vector", "municipality_vector"):
+            if isinstance(municipality_route.get(key), list):
+                route[key] = municipality_route[key]
+
+        base_segments = (
+            base_route.get("segment_context", [])
+            if isinstance(base_route.get("segment_context"), list)
+            else []
+        )
+        municipality_segments = (
+            municipality_route.get("segment_context", [])
+            if isinstance(municipality_route.get("segment_context"), list)
+            else []
+        )
+        municipality_segments_by_index = {
+            int(segment.get("segment_index")): segment
+            for segment in municipality_segments
+            if isinstance(segment, dict)
+        }
+
+        merged_segments = []
+        for base_segment in base_segments:
+            if not isinstance(base_segment, dict):
+                continue
+            segment = dict(base_segment)
+            segment_index = base_segment.get("segment_index")
+            if isinstance(segment_index, int):
+                municipality_segment = municipality_segments_by_index.get(segment_index)
+                if isinstance(municipality_segment, dict):
+                    segment["municipality_trace"] = municipality_segment.get(
+                        "municipality_trace", []
+                    )
+                    segment["municipality_names"] = municipality_segment.get(
+                        "municipality_names", []
+                    )
+                    segment["province_names"] = municipality_segment.get(
+                        "province_names", []
+                    )
+                    segment["province_capital_names"] = municipality_segment.get(
+                        "province_capital_names", []
+                    )
+            merged_segments.append(segment)
+        if merged_segments:
+            route["segment_context"] = merged_segments
+
+        merged_routes.append(route)
+
+    if merged_routes:
+        merged["routes"] = merged_routes
+
+    return merged
+
+
+def _enrich_municipality(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid JSON"}),
+            mimetype="application/json",
+            status_code=400,
+        )
+
+    if not isinstance(body, dict):
+        return func.HttpResponse(
+            json.dumps({"error": "Request body must be a JSON object"}),
+            mimetype="application/json",
+            status_code=400,
+        )
+
+    vrp_result = body.get("vrp_result")
+    if not isinstance(vrp_result, dict) or not isinstance(vrp_result.get("routes"), list):
+        return func.HttpResponse(
+            json.dumps({"error": "vrp_result with routes is required"}),
+            mimetype="application/json",
+            status_code=400,
+        )
+
+    payload = body.get("payload")
+    semantic_payload = dict(payload) if isinstance(payload, dict) else {}
+    semantic_payload["include_semantic_layer"] = True
+    semantic_payload["municipality_enrichment_enabled"] = True
+    semantic_payload["use_here_platform"] = False
+    semantic_payload["here_pipeline_mode"] = _resolve_here_pipeline_mode(
+        semantic_payload.get("here_pipeline_mode")
+    )
+    semantic_payload["here_data_source"] = _resolve_here_data_source(
+        semantic_payload.get("here_data_source")
+    )
+
+    result = dict(vrp_result)
+    existing_semantic = result.get("semantic_layer")
+    try:
+        municipality_semantic = build_semantic_layer(vrp_result, semantic_payload)
+    except Exception as exc:  # noqa: BLE001 - keep base result stable
+        if isinstance(existing_semantic, dict):
+            result["semantic_layer"] = existing_semantic
+        result["semantic_layer_error"] = (
+            "Municipality enrichment failed; base VRP result remains valid."
+        )
+        result["municipality_enrichment_error"] = str(exc)
+        return func.HttpResponse(
+            json.dumps(result), mimetype="application/json", status_code=200
+        )
+
+    if isinstance(existing_semantic, dict):
+        result["semantic_layer"] = _merge_municipality_semantic(
+            existing_semantic, municipality_semantic
+        )
+    else:
+        result["semantic_layer"] = municipality_semantic
+
+    return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
+
+
 @app.route(route="", methods=["GET"])
 def ui(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(HTML_PAGE, mimetype="text/html", status_code=200)
@@ -927,3 +1263,13 @@ def solve_vrp(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="api/solve_vrp", methods=["POST"])
 def solve_vrp_api(req: func.HttpRequest) -> func.HttpResponse:
     return _solve(req)
+
+
+@app.route(route="enrich_municipality", methods=["POST"])
+def enrich_municipality(req: func.HttpRequest) -> func.HttpResponse:
+    return _enrich_municipality(req)
+
+
+@app.route(route="api/enrich_municipality", methods=["POST"])
+def enrich_municipality_api(req: func.HttpRequest) -> func.HttpResponse:
+    return _enrich_municipality(req)

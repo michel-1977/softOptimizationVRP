@@ -18,7 +18,7 @@ def haversine_km(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return 6371.0 * 2 * math.asin(math.sqrt(h))
 
 
-def route_distance_km(route: List[Dict]) -> float:
+def route_distance_km(route: List[Dict]) -> float: 
     if len(route) < 2:
         return 0.0
     total = 0.0
@@ -58,7 +58,7 @@ class Edge:
         self.inv_edge: Optional["Edge"] = None
 
 
-class Route:
+class Route:  # Represents a route starting and ending at the depot, with zero or more customers in between.
     def __init__(self) -> None:
         self.cost = 0.0
         self.edges: List[Edge] = []
@@ -68,14 +68,14 @@ class Route:
         self.edges = [edge.inv_edge for edge in reversed(self.edges) if edge.inv_edge]
 
 
-def build_distance_matrix_km(
+def build_distance_matrix_km( # Exposed for testing purposes, not part of the public API.
     points: List[Dict], distance_mode: str, osrm_base_url: str
 ) -> List[List[float]]:
     matrix, _ = _build_distance_matrix_km_with_meta(points, distance_mode, osrm_base_url)
     return matrix
 
 
-def _build_distance_matrix_km_with_meta(
+def _build_distance_matrix_km_with_meta(  # Internal function that returns both the distance matrix and metadata about the source of distances and any warnings.
     points: List[Dict], distance_mode: str, osrm_base_url: str
 ) -> Tuple[List[List[float]], Dict[str, Optional[str]]]:
     if distance_mode == "direct":
@@ -95,8 +95,9 @@ def _build_distance_matrix_km_with_meta(
     data = None
     last_exc = None
     for attempt in range(3):
+    # Retry up to 3 times with exponential backoff if OSRM request fails, to handle transient issues with the public OSRM service.
         try:
-            with urllib.request.urlopen(url, timeout=25) as response:
+            with urllib.request.urlopen(url, timeout=25) as response: # 25 second timeout to allow for larger tables to be processed by OSRM
                 data = json.loads(response.read().decode("utf-8"))
             break
         except Exception as exc:
@@ -138,7 +139,7 @@ def _build_distance_matrix_km_with_meta(
     return matrix_km, {"distance_source": "osrm", "warning": None}
 
 
-def route_distance_from_matrix_km(
+def route_distance_from_matrix_km( # Computes route distance using the provided distance matrix, falling back to haversine if any leg is missing.
     route: List[Dict], idx_by_id: Dict, distance_matrix_km: List[List[float]]
 ) -> float:
     if len(route) < 2:
@@ -163,19 +164,19 @@ def route_distance_from_matrix_km(
     return total
 
 
-def _check_merging_conditions(
+def _check_merging_conditions( # Checks if two routes can be merged based on the Clarke-Wright conditions.
     i_node: Node, j_node: Node, i_route: Route, j_route: Route, capacity: int
 ) -> bool:
-    if i_route is j_route:
+    if i_route is j_route:  # Already in the same route, no need to merge.
         return False
-    if i_node.is_interior or j_node.is_interior:
+    if i_node.is_interior or j_node.is_interior: # Can only merge if both nodes are currently route endpoints (not interior).
         return False
-    if i_route.demand + j_route.demand > capacity:
+    if i_route.demand + j_route.demand > capacity: # Merging would exceed vehicle capacity, not allowed.
         return False
     return True
 
 
-def _get_depot_edge(a_route: Route, a_node: Node, depot: Node) -> Edge:
+def _get_depot_edge(a_route: Route, a_node: Node, depot: Node) -> Edge: # Gets the edge in the route that connects the given node to the depot.
     first = a_route.edges[0]
     if (first.origin is a_node and first.end is depot) or (
         first.origin is depot and first.end is a_node
@@ -184,7 +185,7 @@ def _get_depot_edge(a_route: Route, a_node: Node, depot: Node) -> Edge:
     return a_route.edges[-1]
 
 
-def _route_stops(route: Route, depot: Node) -> List[Dict]:
+def _route_stops(route: Route, depot: Node) -> List[Dict]: # Converts a Route object into a list of stops (dicts) starting and ending with the depot.
     if not route.edges:
         return [dict(depot.payload), dict(depot.payload)]
 
@@ -202,17 +203,18 @@ def _route_stops(route: Route, depot: Node) -> List[Dict]:
     return stops
 
 
-def _route_customer_count(route: Route, depot: Node) -> int:
+def _route_customer_count(route: Route, depot: Node) -> int: # Counts the number of customers in the route by counting edges that end at a non-depot node.
     return sum(1 for edge in route.edges if edge.end is not depot)
 
 
-def _build_clarke_wright_routes(
+def _build_clarke_wright_routes( # Builds initial routes using the Clarke-Wright Savings algorithm.
     depot: Dict,
     customers: List[Dict],
     capacity: int,
     distance_matrix_km: List[List[float]],
     idx_by_id: Dict,
-) -> Tuple[List[Route], Node]:
+) -> Tuple[List[Route], Node]: #
+    # Create depot node and customer nodes
     depot_node = Node(
         depot["id"],
         float(depot["lat"]),
@@ -232,6 +234,7 @@ def _build_clarke_wright_routes(
             )
         )
 
+    # Create edges between depot and each customer (both directions)
     depot_idx = idx_by_id[depot_node.ID]
     for node in nodes[1:]:
         node_idx = idx_by_id[node.ID]
@@ -244,6 +247,7 @@ def _build_clarke_wright_routes(
         node.dn_edge = dn_edge
         node.nd_edge = nd_edge
 
+    # Calculate savings for every pair of customers (how much distance is saved by connecting them directly)
     savings_list: List[Edge] = []
     for i in range(1, len(nodes) - 1):
         i_node = nodes[i]
@@ -261,8 +265,10 @@ def _build_clarke_wright_routes(
             ji_edge.savings = j_node.nd_edge.cost + i_node.dn_edge.cost - ji_edge.cost
             savings_list.extend((ij_edge, ji_edge))
 
+    # Sort savings in descending order (most beneficial merges first)
     savings_list.sort(key=lambda edge: edge.savings, reverse=True)
 
+    # Start with each customer in its own route (depot -> customer -> depot)
     routes: List[Route] = []
     for node in nodes[1:]:
         route = Route()
@@ -275,6 +281,7 @@ def _build_clarke_wright_routes(
         node.is_interior = False
         routes.append(route)
 
+    # Try to merge routes using the best savings, as long as constraints are satisfied
     while savings_list:
         ij_edge = savings_list.pop(0)
         i_node = ij_edge.origin
@@ -282,11 +289,13 @@ def _build_clarke_wright_routes(
         i_route = i_node.in_route
         j_route = j_node.in_route
 
+        # Skip if nodes are already merged or merging is not allowed
         if i_route is None or j_route is None:
             continue
         if not _check_merging_conditions(i_node, j_node, i_route, j_route, capacity):
             continue
 
+        # Remove depot edge from i_route and j_route, update costs
         i_edge = _get_depot_edge(i_route, i_node, depot_node)
         i_route.edges.remove(i_edge)
         i_route.cost -= i_edge.cost
@@ -303,19 +312,23 @@ def _build_clarke_wright_routes(
         if j_route.edges and j_route.edges[0].origin is depot_node:
             j_route.reverse()
 
+        # Merge j_route into i_route via the savings edge
         i_route.edges.append(ij_edge)
         i_route.cost += ij_edge.cost
         i_route.demand += j_node.demand
         j_node.in_route = i_route
 
+        # Append all edges from j_route to i_route, update demand and route assignments
         for edge in j_route.edges:
             i_route.edges.append(edge)
             i_route.cost += edge.cost
             i_route.demand += edge.end.demand
             edge.end.in_route = i_route
 
+        # Remove the merged route from the list
         routes.remove(j_route)
 
+    # Return the list of routes and the depot node
     return routes, depot_node
 
 

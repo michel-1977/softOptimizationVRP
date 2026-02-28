@@ -93,6 +93,20 @@ NON_MUNICIPALITY_ADMIN_FIELDS = {
     "county",
 }
 
+PROVINCE_ADDRESS_PRIORITY = (
+    "province",
+    "state",
+    "state_district",
+    "region",
+    "county",
+)
+
+PROVINCE_CAPITAL_MEMBER_ROLES = (
+    "admin_centre",
+    "capital",
+    "label",
+)
+
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
@@ -221,6 +235,290 @@ def _extract_municipality_from_reverse_payload(
         if value:
             return value, key
     return None, None
+
+
+def _extract_province_from_address(address: Any) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(address, dict):
+        return None, None
+    for key in PROVINCE_ADDRESS_PRIORITY:
+        value = str(address.get(key) or "").strip()
+        if value:
+            return value, key
+    return None, None
+
+
+def _extract_country_code_from_address(address: Any) -> Optional[str]:
+    if not isinstance(address, dict):
+        return None
+    value = str(address.get("country_code") or "").strip().upper()
+    return value or None
+
+
+def _escape_overpass_literal(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _query_overpass_json(query: str, timeout_sec: int) -> Dict[str, Any]:
+    body = urllib.parse.urlencode({"data": query}).encode("utf-8")
+    payload = None
+    last_error: Optional[str] = None
+    for endpoint in DEFAULT_OVERPASS_ENDPOINTS:
+        try:
+            request = urllib.request.Request(
+                endpoint,
+                data=body,
+                headers={
+                    "User-Agent": "softOptimizationVRP/province-capital-resolver",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=max(2, timeout_sec)) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise RuntimeError("Unexpected Overpass payload.")
+            remark = str(payload.get("remark") or "").strip()
+            if remark:
+                raise RuntimeError(f"Overpass remark: {remark}")
+            return payload
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{endpoint}: {exc}"
+            time.sleep(0.15)
+    raise RuntimeError(last_error or "No Overpass endpoint available.")
+
+
+def _province_name_match_score(candidate: str, target: str) -> int:
+    cand = str(candidate or "").strip().casefold()
+    tgt = str(target or "").strip().casefold()
+    if not cand or not tgt:
+        return 99
+    if cand == tgt:
+        return 0
+    if cand.startswith(tgt) or cand.endswith(tgt) or tgt in cand:
+        return 1
+    if tgt.startswith(cand) or tgt.endswith(cand) or cand in tgt:
+        return 2
+    return 99
+
+
+def _pick_province_relation(
+    elements: List[Dict[str, Any]],
+    province_name: str,
+    country_code: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not province_name:
+        return None
+    candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
+    for element in elements:
+        if not isinstance(element, dict) or element.get("type") != "relation":
+            continue
+        tags = element.get("tags", {})
+        if not isinstance(tags, dict):
+            continue
+        relation_name = str(tags.get("name") or "").strip()
+        name_score = _province_name_match_score(relation_name, province_name)
+        if name_score >= 90:
+            continue
+        iso_code = str(tags.get("ISO3166-2") or "").strip().upper()
+        cc = str(country_code or "").strip().upper()
+        country_score = 0 if (cc and iso_code.startswith(f"{cc}-")) else (1 if cc else 0)
+        admin_level = _safe_int(tags.get("admin_level"), 99)
+        level_score = abs(admin_level - 6)
+        members = element.get("members", [])
+        has_capital_member = (
+            isinstance(members, list)
+            and any(
+                str(member.get("role") or "").strip().lower()
+                in PROVINCE_CAPITAL_MEMBER_ROLES
+                for member in members
+                if isinstance(member, dict)
+            )
+        )
+        candidates.append(
+            (
+                (
+                    name_score,
+                    country_score,
+                    level_score,
+                    0 if has_capital_member else 1,
+                    relation_name.casefold(),
+                ),
+                element,
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: row[0])
+    return candidates[0][1]
+
+
+def _extract_capital_from_relation(
+    relation: Dict[str, Any],
+    elements: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    by_ref: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        ref_type = str(element.get("type") or "").strip().lower()
+        ref_id = element.get("id")
+        if ref_type and isinstance(ref_id, (int, float)):
+            by_ref[(ref_type, int(ref_id))] = element
+
+    members = relation.get("members", [])
+    if not isinstance(members, list):
+        members = []
+    for role in PROVINCE_CAPITAL_MEMBER_ROLES:
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            member_role = str(member.get("role") or "").strip().lower()
+            if member_role != role:
+                continue
+            member_type = str(member.get("type") or "").strip().lower()
+            member_ref = member.get("ref")
+            if not member_type or not isinstance(member_ref, (int, float)):
+                continue
+            element = by_ref.get((member_type, int(member_ref)))
+            if not isinstance(element, dict):
+                continue
+            tags = element.get("tags", {})
+            if not isinstance(tags, dict):
+                tags = {}
+            name = str(tags.get("name") or "").strip()
+            if not name:
+                continue
+            lat = _safe_float(element.get("lat"))
+            lng = _safe_float(element.get("lon"))
+            if lat is None or lng is None:
+                center = element.get("center")
+                if isinstance(center, dict):
+                    lat = _safe_float(center.get("lat"))
+                    lng = _safe_float(center.get("lon"))
+            osm_ref = f"{member_type}/{int(member_ref)}"
+            return {
+                "name": name,
+                "lat": round(float(lat), 6) if lat is not None else None,
+                "lng": round(float(lng), 6) if lng is not None else None,
+                "osm_ref": osm_ref,
+                "member_role": role,
+                "source": "overpass_relation_member",
+            }
+    return None
+
+
+def _resolve_province_capital(
+    province_name: Optional[str],
+    country_code: Optional[str],
+    cache: Dict[str, Dict[str, Any]],
+    errors: Optional[List[str]],
+    timeout_sec: int,
+) -> Dict[str, Any]:
+    normalized_name = str(province_name or "").strip()
+    cc = str(country_code or "").strip().upper()
+    if not normalized_name:
+        return {
+            "status": "unknown",
+            "province_name": None,
+            "country_code": cc or None,
+            "capital_name": None,
+            "capital_osm_ref": None,
+            "capital_lat": None,
+            "capital_lng": None,
+            "source": None,
+            "error": None,
+        }
+
+    key = f"{cc}|{normalized_name.casefold()}"
+    cached = cache.get(key)
+    if isinstance(cached, dict):
+        return cached
+
+    escaped_name = _escape_overpass_literal(normalized_name)
+    query = (
+        f"[out:json][timeout:{max(5, timeout_sec)}];\n(\n"
+        f'  relation["boundary"="administrative"]["name"="{escaped_name}"]["admin_level"~"4|5|6|7|8"];\n'
+        f'  relation["type"="boundary"]["name"="{escaped_name}"]["admin_level"~"4|5|6|7|8"];\n'
+        ");\nout body;\n>;\nout body;"
+    )
+    try:
+        payload = _query_overpass_json(query, timeout_sec=max(3, timeout_sec))
+        elements = payload.get("elements", [])
+        if not isinstance(elements, list):
+            raise RuntimeError("Overpass relation payload missing elements.")
+        relation = _pick_province_relation(elements, normalized_name, cc)
+        if not isinstance(relation, dict):
+            result = {
+                "status": "unknown",
+                "province_name": normalized_name,
+                "country_code": cc or None,
+                "capital_name": None,
+                "capital_osm_ref": None,
+                "capital_lat": None,
+                "capital_lng": None,
+                "source": "overpass_relation_member",
+                "error": "province_relation_not_found",
+            }
+            cache[key] = result
+            return result
+
+        capital = _extract_capital_from_relation(relation, elements)
+        if not isinstance(capital, dict):
+            result = {
+                "status": "unknown",
+                "province_name": normalized_name,
+                "country_code": cc or None,
+                "capital_name": None,
+                "capital_osm_ref": None,
+                "capital_lat": None,
+                "capital_lng": None,
+                "source": "overpass_relation_member",
+                "error": "province_capital_not_found",
+            }
+            cache[key] = result
+            return result
+
+        result = {
+            "status": "resolved",
+            "province_name": normalized_name,
+            "country_code": cc or None,
+            "capital_name": capital.get("name"),
+            "capital_osm_ref": capital.get("osm_ref"),
+            "capital_lat": capital.get("lat"),
+            "capital_lng": capital.get("lng"),
+            "source": capital.get("source"),
+            "member_role": capital.get("member_role"),
+            "error": None,
+        }
+        cache[key] = result
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "status": "error",
+            "province_name": normalized_name,
+            "country_code": cc or None,
+            "capital_name": None,
+            "capital_osm_ref": None,
+            "capital_lat": None,
+            "capital_lng": None,
+            "source": "overpass_relation_member",
+            "error": str(exc),
+        }
+        cache[key] = result
+        if errors is not None:
+            errors.append(
+                f"province capital lookup failed for '{normalized_name}' ({cc or 'n/a'}): {exc}"
+            )
+        return result
+
+
+def _append_unique_in_order(items: List[str], value: Any) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    if items and items[-1].casefold() == text.casefold():
+        return
+    items.append(text)
 
 
 def _new_point_registry_entry(lat: float, lng: float, coord_key: str) -> Dict[str, Any]:
@@ -655,6 +953,130 @@ def _build_route_stop_municipality_links(
             }
         )
     return links
+
+
+def _build_phase1_input_points(
+    phase1_points: Dict[str, Dict[str, Any]],
+    municipality_book: Dict[str, Dict[str, Any]],
+    province_capital_cache: Dict[str, Dict[str, Any]],
+    province_capital_errors: Optional[List[str]],
+    province_capital_lookup_enabled: bool,
+    province_capital_timeout_sec: int,
+) -> List[Dict[str, Any]]:
+    points_output: List[Dict[str, Any]] = []
+    for coord_key in sorted(phase1_points.keys()):
+        point = phase1_points.get(coord_key, {})
+        if not isinstance(point, dict):
+            continue
+        source_tags = point.get("source_tags", [])
+        if not isinstance(source_tags, list):
+            source_tags = []
+        if "depot_input" in source_tags:
+            point_role = "depot"
+        elif "customer_input" in source_tags:
+            point_role = "customer"
+        else:
+            continue
+
+        resolved = municipality_book.get(coord_key, {})
+        if not isinstance(resolved, dict):
+            resolved = {}
+        address = resolved.get("address", {})
+        province_name, province_source_field = _extract_province_from_address(address)
+        country_code = _extract_country_code_from_address(address)
+        province_capital = (
+            _resolve_province_capital(
+                province_name=province_name,
+                country_code=country_code,
+                cache=province_capital_cache,
+                errors=province_capital_errors,
+                timeout_sec=province_capital_timeout_sec,
+            )
+            if province_capital_lookup_enabled and province_name
+            else {}
+        )
+
+        entry = {
+            "coord_key": coord_key,
+            "role": point_role,
+            "lat": round(float(point.get("lat", 0.0)), 6),
+            "lng": round(float(point.get("lng", 0.0)), 6),
+            "stop_ids": list(point.get("stop_ids", []))
+            if isinstance(point.get("stop_ids"), list)
+            else [],
+            "customer_ids": list(point.get("customer_ids", []))
+            if isinstance(point.get("customer_ids"), list)
+            else [],
+            "status": resolved.get("status", "unknown"),
+            "resolution_note": resolved.get("resolution_note"),
+            "municipality_name": resolved.get("municipality_name"),
+            "municipality_source_field": resolved.get("municipality_source_field"),
+            "province_name": province_name,
+            "province_source_field": province_source_field,
+            "province_capital_name": (
+                province_capital.get("capital_name")
+                if isinstance(province_capital, dict)
+                else None
+            ),
+            "province_capital_status": (
+                province_capital.get("status")
+                if isinstance(province_capital, dict)
+                else None
+            ),
+            "country_code": country_code,
+            "address_ref": coord_key,
+        }
+        points_output.append(entry)
+    return points_output
+
+
+def _build_segment_admin_vectors(
+    municipality_trace: List[Dict[str, Any]],
+    municipality_book: Dict[str, Dict[str, Any]],
+    province_capital_cache: Dict[str, Dict[str, Any]],
+    province_capital_errors: Optional[List[str]],
+    province_capital_lookup_enabled: bool,
+    province_capital_timeout_sec: int,
+) -> Tuple[List[str], List[str], List[str]]:
+    segment_municipality_vector: List[str] = []
+    segment_province_vector: List[str] = []
+    segment_province_capital_vector: List[str] = []
+    for row in municipality_trace:
+        if not isinstance(row, dict):
+            continue
+        municipality = row.get("municipality", {})
+        if not isinstance(municipality, dict):
+            municipality = {}
+        municipality_name = municipality.get("name")
+        _append_unique_in_order(segment_municipality_vector, municipality_name)
+
+        address_ref = str(municipality.get("address_ref") or "").strip()
+        if not address_ref:
+            continue
+        resolved = municipality_book.get(address_ref, {})
+        if not isinstance(resolved, dict):
+            continue
+        address = resolved.get("address", {})
+        province_name, _ = _extract_province_from_address(address)
+        _append_unique_in_order(segment_province_vector, province_name)
+        if not (province_capital_lookup_enabled and province_name):
+            continue
+        capital = _resolve_province_capital(
+            province_name=province_name,
+            country_code=_extract_country_code_from_address(address),
+            cache=province_capital_cache,
+            errors=province_capital_errors,
+            timeout_sec=province_capital_timeout_sec,
+        )
+        if isinstance(capital, dict):
+            _append_unique_in_order(
+                segment_province_capital_vector, capital.get("capital_name")
+            )
+    return (
+        segment_municipality_vector,
+        segment_province_vector,
+        segment_province_capital_vector,
+    )
 
 
 def _interpolate_point(
@@ -1516,6 +1938,16 @@ def build_semantic_layer(
     municipality_timeout_sec = max(
         2, _safe_int(raw_payload.get("municipality_osm_timeout_sec"), DEFAULT_OSM_TIMEOUT_SEC)
     )
+    province_capital_lookup_enabled = _safe_bool(
+        raw_payload.get("province_capital_lookup_enabled"), True
+    )
+    province_capital_timeout_sec = max(
+        2,
+        _safe_int(
+            raw_payload.get("province_capital_timeout_sec"),
+            municipality_timeout_sec,
+        ),
+    )
     municipality_max_samples_per_segment = max(
         3,
         _safe_int(
@@ -1586,8 +2018,11 @@ def build_semantic_layer(
     here_errors: List[str] = []
     municipality_records = 0
     municipality_errors: List[str] = []
+    province_capital_errors: List[str] = []
     municipality_phase1_points: Dict[str, Dict[str, Any]] = {}
     municipality_phase2_points: Dict[str, Dict[str, Any]] = {}
+    municipality_phase1_input_points: List[Dict[str, Any]] = []
+    province_capital_cache: Dict[str, Dict[str, Any]] = {}
     municipality_lookup = _build_municipality_lookup(
         initial_book={},
         timeout_sec=municipality_timeout_sec,
@@ -1636,6 +2071,13 @@ def build_semantic_layer(
         "resolved": 0,
         "unknown": 0,
         "failed": 0,
+        "province_capitals": {
+            "enabled": bool(province_capital_lookup_enabled),
+            "status": "disabled",
+            "resolved": 0,
+            "total": 0,
+            "errors": [],
+        },
         "errors": [],
     }
     if municipality_enrichment_enabled:
@@ -1679,6 +2121,14 @@ def build_semantic_layer(
             "http_requests": phase1_delta["http_requests"],
             "cache_hits": phase1_delta["cache_hits"],
         }
+        municipality_phase1_input_points = _build_phase1_input_points(
+            phase1_points=municipality_phase1_points,
+            municipality_book=municipality_lookup["book"],
+            province_capital_cache=province_capital_cache,
+            province_capital_errors=province_capital_errors,
+            province_capital_lookup_enabled=province_capital_lookup_enabled,
+            province_capital_timeout_sec=province_capital_timeout_sec,
+        )
         phase2_snapshot_before = _lookup_snapshot(municipality_lookup)
 
     for route in vrp_result.get("routes", []):
@@ -1689,6 +2139,9 @@ def build_semantic_layer(
             if municipality_enrichment_enabled
             else []
         )
+        route_municipality_vector: List[str] = []
+        route_province_vector: List[str] = []
+        route_province_capital_vector: List[str] = []
         semantic_locations = _semantic_locations_for_route(
             route,
             candidate_locations,
@@ -1793,6 +2246,9 @@ def build_semantic_layer(
                 )
 
             municipality_trace = []
+            segment_municipality_vector: List[str] = []
+            segment_province_vector: List[str] = []
+            segment_province_capital_vector: List[str] = []
             if municipality_enrichment_enabled:
                 route_shape_points: Optional[List[Dict[str, float]]] = None
                 if municipality_route_geometry_enabled:
@@ -1837,6 +2293,24 @@ def build_semantic_layer(
                     max_samples=municipality_max_samples_per_segment,
                     route_shape_points=route_shape_points,
                 )
+                (
+                    segment_municipality_vector,
+                    segment_province_vector,
+                    segment_province_capital_vector,
+                ) = _build_segment_admin_vectors(
+                    municipality_trace=municipality_trace,
+                    municipality_book=municipality_lookup["book"],
+                    province_capital_cache=province_capital_cache,
+                    province_capital_errors=province_capital_errors,
+                    province_capital_lookup_enabled=province_capital_lookup_enabled,
+                    province_capital_timeout_sec=province_capital_timeout_sec,
+                )
+                for municipality_name in segment_municipality_vector:
+                    _append_unique_in_order(route_municipality_vector, municipality_name)
+                for province_name in segment_province_vector:
+                    _append_unique_in_order(route_province_vector, province_name)
+                for capital_name in segment_province_capital_vector:
+                    _append_unique_in_order(route_province_capital_vector, capital_name)
             municipality_records += len(municipality_trace)
 
             segment_context.append(
@@ -1850,9 +2324,9 @@ def build_semantic_layer(
                     "eta_utc": segment["eta_utc"],
                     "midpoint": segment["midpoint"],
                     "municipality_trace": municipality_trace,
-                    "municipality_names": [
-                        item["municipality"]["name"] for item in municipality_trace
-                    ],
+                    "municipality_names": segment_municipality_vector,
+                    "province_names": segment_province_vector,
+                    "province_capital_names": segment_province_capital_vector,
                     "weather": weather_context,
                     "traffic": traffic_context,
                 }
@@ -1876,6 +2350,9 @@ def build_semantic_layer(
                 "route_distance_km": route.get("distance_km"),
                 "served_customer_ids": route.get("served_customer_ids", []),
                 "stop_municipality_links": route_stop_municipality_links,
+                "province_vector": route_province_vector,
+                "province_capital_vector": route_province_capital_vector,
+                "municipality_vector": route_municipality_vector,
                 "semantic_locations": semantic_locations,
                 "segment_context": segment_context,
             }
@@ -1972,8 +2449,37 @@ def build_semantic_layer(
                 "cache_hits": int(municipality_lookup.get("cache_hits", 0)),
                 "address_book_size": len(municipality_address_book),
             },
+            "province_capitals": {
+                "enabled": bool(province_capital_lookup_enabled),
+                "status": (
+                    "ok"
+                    if all(
+                        str(entry.get("status") or "").strip().lower() == "resolved"
+                        for entry in province_capital_cache.values()
+                    )
+                    else (
+                        "partial"
+                        if any(
+                            str(entry.get("status") or "").strip().lower() == "resolved"
+                            for entry in province_capital_cache.values()
+                        )
+                        else (
+                            "failed"
+                            if province_capital_cache
+                            else "empty"
+                        )
+                    )
+                ),
+                "resolved": sum(
+                    1
+                    for entry in province_capital_cache.values()
+                    if str(entry.get("status") or "").strip().lower() == "resolved"
+                ),
+                "total": len(province_capital_cache),
+                "errors": province_capital_errors[:20],
+            },
             "route_geometry": dict(segment_shape_stats),
-            "errors": municipality_errors[:40],
+            "errors": (municipality_errors + province_capital_errors)[:40],
         }
         fallback_to_straight = int(
             municipality_api.get("route_geometry", {}).get("fallback_to_straight", 0)
@@ -2038,6 +2544,8 @@ def build_semantic_layer(
             "municipality_use_route_geometry": municipality_use_route_geometry,
             "municipality_route_geometry_enabled": municipality_route_geometry_enabled,
             "municipality_route_geometry_timeout_sec": municipality_route_geometry_timeout_sec,
+            "province_capital_lookup_enabled": bool(province_capital_lookup_enabled),
+            "province_capital_timeout_sec": province_capital_timeout_sec,
             "distance_mode": distance_mode,
             "distance_source": distance_source,
         },
@@ -2088,12 +2596,20 @@ def build_semantic_layer(
                 else 0
             ),
             "municipality_address_records": len(municipality_address_book),
+            "municipality_phase1_input_points": len(municipality_phase1_input_points),
+            "province_capital_records": len(province_capital_cache),
+            "province_capital_resolved": sum(
+                1
+                for entry in province_capital_cache.values()
+                if str(entry.get("status") or "").strip().lower() == "resolved"
+            ),
             "municipality_post_output_notice": municipality_post_output_notice,
             "here_client_stats": here_client.stats() if here_client is not None else {},
         },
-        "errors": (here_errors + municipality_errors)[:40],
+        "errors": (here_errors + municipality_errors + province_capital_errors)[:40],
         "municipality_api": municipality_api,
         "municipality_address_book": municipality_address_book,
+        "municipality_phase1_input_points": municipality_phase1_input_points,
         "municipality_post_output_notice": municipality_post_output_notice,
         "municipality_post_output_warnings": municipality_post_output_warnings,
         "routes": routes_output,
