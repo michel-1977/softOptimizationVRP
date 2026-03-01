@@ -59,6 +59,9 @@ Every solve response now includes `semantic_layer` by default (disable with `inc
 Optional request fields for enrichment:
 
 - `candidate_locations`: list of candidate POIs, each with `lat`, `lng`, optional `id`, `name`, `semantic_category`, `tags`, `source`
+- `poi_auto_enabled`: when `true`, backend auto-fetches POI candidates from OSM Overpass if `candidate_locations` is not provided
+- `poi_auto_radius_km`: probe radius used for auto POI fetch (default `3.0`)
+- `poi_auto_max_candidates`: maximum auto-generated candidates kept (default `250`)
 - `semantic_categories`: list of category filters (for relevance scoring)
 - `semantic_corridor_radius_km`: max distance from route to consider location relevant
 - `semantic_top_k`: max ranked locations returned per route
@@ -73,6 +76,10 @@ Optional request fields for enrichment:
 - `here_traffic_radius_m`: real-time traffic query radius around each segment midpoint
 - `here_forecast_window_hours`: forecast window size (default 24)
 - `here_forecast_interval_min`: sampling interval for forecast slots (default 120)
+- `municipality_llm_enrichment_enabled`: enable Azure OpenAI municipality completion over route + segments (default `true` when municipality enrichment is enabled)
+- `municipality_llm_timeout_sec`: timeout for Azure OpenAI calls (default `60`)
+- `municipality_llm_retries`: number of LLM retries per route (default `2`)
+- `azure_openai_endpoint`, `azure_openai_api_key`, `azure_openai_deployment`, `azure_openai_api_version`: optional payload overrides (normally read from environment variables)
 
 The response `semantic_layer` contains:
 
@@ -97,7 +104,11 @@ For local Azure Functions runs, copy `local.settings.example.json` to `local.set
 ```json
 {
   "Values": {
-    "HERE_API_KEY": "YOUR_HERE_KEY"
+    "HERE_API_KEY": "YOUR_HERE_KEY",
+    "AZURE_OPENAI_ENDPOINT": "https://YOUR_RESOURCE_NAME.openai.azure.com/",
+    "AZURE_OPENAI_API_KEY": "YOUR_AZURE_OPENAI_KEY",
+    "AZURE_OPENAI_DEPLOYMENT": "YOUR_DEPLOYMENT_NAME",
+    "AZURE_OPENAI_API_VERSION": "2024-10-21"
   }
 }
 ```

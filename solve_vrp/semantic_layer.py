@@ -3,7 +3,10 @@ import json
 import math
 import os
 import time
+import unicodedata
+import difflib
 from typing import Any, Dict, List, Optional, Set, Tuple
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -19,12 +22,17 @@ DEFAULT_HERE_TIMEOUT_SEC = 12
 DEFAULT_HERE_TRAFFIC_RADIUS_M = 300
 DEFAULT_HERE_FORECAST_WINDOW_HOURS = 24
 DEFAULT_HERE_FORECAST_INTERVAL_MIN = 120
-DEFAULT_MUNICIPALITY_STEP_KM = 20.0
+DEFAULT_MUNICIPALITY_STEP_KM = 40.0 # was 20
 DEFAULT_MUNICIPALITY_RADIUS_KM = 5.0
 DEFAULT_OSM_TIMEOUT_SEC = 8
 DEFAULT_OSRM_ROUTE_TIMEOUT_SEC = 10
-DEFAULT_MUNICIPALITY_MAX_SAMPLES_PER_SEGMENT = 12
+DEFAULT_MUNICIPALITY_MAX_SAMPLES_PER_SEGMENT = 6 # was 12
 DEFAULT_MUNICIPALITY_REVERSE_MIN_INTERVAL_MS = 1100
+DEFAULT_AZURE_OPENAI_API_VERSION = "2024-10-21"
+DEFAULT_MUNICIPALITY_LLM_TIMEOUT_SEC = 90
+DEFAULT_MUNICIPALITY_LLM_RETRIES = 2
+DEFAULT_MUNICIPALITY_LLM_MAX_TOKENS = 4000
+MUNICIPALITY_LLM_TEMPERATURE = 1
 DEFAULT_OVERPASS_ENDPOINTS = (
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -190,6 +198,26 @@ def _parse_utc_datetime(value: Any) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _safe_console_print(*values: Any) -> None:
+    text = " ".join(str(value) for value in values)
+    try:
+        print(text)
+        return
+    except UnicodeEncodeError:
+        pass
+    except Exception:
+        return
+
+    try:
+        fallback = text.encode("ascii", errors="backslashreplace").decode("ascii")
+        print(fallback)
+    except Exception:
+        try:
+            print(repr(text))
+        except Exception:
+            return
 
 
 def _normalize_categories(raw: Any) -> Set[str]:
@@ -513,12 +541,920 @@ def _resolve_province_capital(
 
 
 def _append_unique_in_order(items: List[str], value: Any) -> None:
-    text = str(value or "").strip()
+    text = _normalize_llm_text(value)
     if not text:
         return
     if items and items[-1].casefold() == text.casefold():
         return
     items.append(text)
+
+
+def _mojibake_penalty(text: str) -> int:
+    raw = str(text or "")
+    return (
+        raw.count("\uFFFD")
+        + raw.count("Ã")
+        + raw.count("Â")
+        + raw.count("â")
+    )
+
+
+def _normalize_llm_text(value: Any) -> str:
+    text = unicodedata.normalize("NFC", str(value or "").strip())
+    if not text:
+        return ""
+    repaired = text
+    if any(marker in text for marker in ("Ã", "Â", "â")):
+        try:
+            candidate = text.encode("latin-1").decode("utf-8")
+            if _mojibake_penalty(candidate) < _mojibake_penalty(repaired):
+                repaired = candidate
+        except Exception:  # noqa: BLE001
+            pass
+    return unicodedata.normalize("NFC", repaired).strip()
+
+
+def _normalize_municipality_vector(items: Any) -> List[str]:
+    if not isinstance(items, list):
+        return []
+    normalized: List[str] = []
+    for value in items:
+        _append_unique_in_order(normalized, value)
+    return normalized
+
+
+def _normalize_road_vector(items: Any) -> List[str]:
+    if not isinstance(items, list):
+        return []
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    for value in items:
+        text = _normalize_llm_text(value)
+        if not text:
+            continue
+        lowered = text.casefold()
+        if lowered in {"unnamed road", "road", "unknown road", "n/a"}:
+            continue
+        key = _canonical_name_key(text) or lowered
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def _sample_vector_items(items: Any, max_items: int) -> List[str]:
+    if max_items <= 0:
+        return []
+    if not isinstance(items, list):
+        return []
+    cleaned: List[str] = []
+    for value in items:
+        text = _normalize_llm_text(value)
+        if not text:
+            continue
+        if cleaned and cleaned[-1].casefold() == text.casefold():
+            continue
+        cleaned.append(text)
+    if len(cleaned) <= max_items:
+        return cleaned
+    if max_items == 1:
+        return [cleaned[0]]
+
+    last_index = len(cleaned) - 1
+    step = last_index / float(max_items - 1)
+    sampled: List[str] = []
+    for idx in range(max_items):
+        source_index = int(round(idx * step))
+        source_index = max(0, min(last_index, source_index))
+        _append_unique_in_order(sampled, cleaned[source_index])
+    return sampled
+
+
+def _canonical_name_key(text: Any) -> str:
+    value = _normalize_llm_text(text)
+    if not value:
+        return ""
+    folded = unicodedata.normalize("NFKD", value)
+    ascii_like = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return "".join(ch for ch in ascii_like.casefold() if ch.isalnum())
+
+
+def _is_suspect_municipality_name(text: Any) -> bool:
+    value = str(text or "")
+    return (
+        "\uFFFD" in value
+        or "Ã" in value
+        or "Â" in value
+        or "â" in value
+        or "�" in value
+        or "?" in value
+        or "\\u" in value
+    )
+
+
+def _repair_name_from_candidates(
+    raw_name: Any,
+    canonical_by_key: Dict[str, str],
+) -> str:
+    normalized_name = _normalize_llm_text(raw_name)
+    if not normalized_name:
+        return ""
+    direct_key = _canonical_name_key(normalized_name)
+    if direct_key and direct_key in canonical_by_key:
+        return canonical_by_key[direct_key]
+    if not _is_suspect_municipality_name(raw_name):
+        return normalized_name
+    if not direct_key:
+        return normalized_name
+
+    candidate_keys = list(canonical_by_key.keys())
+    if not candidate_keys:
+        return normalized_name
+    best_key = ""
+    best_ratio = 0.0
+    for candidate_key in candidate_keys:
+        ratio = difflib.SequenceMatcher(None, direct_key, candidate_key).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_key = candidate_key
+    if best_key and best_ratio >= 0.78:
+        return canonical_by_key[best_key]
+    return normalized_name
+
+
+def _municipality_chain_label(items: Any) -> str:
+    names = _normalize_municipality_vector(items)
+    if not names:
+        return "n/a"
+    return " -> ".join(names)
+
+
+def _road_chain_label(items: Any) -> str:
+    names = _normalize_road_vector(items)
+    if not names:
+        return "n/a"
+    return " -> ".join(names)
+
+
+def _extract_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_text, str):
+        return None
+    text = raw_text.strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _extract_chat_completion_content(message: Any) -> str:
+    def _collect_text(value: Any) -> List[str]:
+        parts: List[str] = []
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                parts.append(text)
+            return parts
+        if isinstance(value, list):
+            for item in value:
+                parts.extend(_collect_text(item))
+            return parts
+        if isinstance(value, dict):
+            for key in ("text", "content", "value", "output_text"):
+                if key in value:
+                    parts.extend(_collect_text(value.get(key)))
+            return parts
+        return parts
+
+    if isinstance(message, str):
+        return message.strip()
+    if isinstance(message, list):
+        return "\n".join(_collect_text(message)).strip()
+    if isinstance(message, dict):
+        return "\n".join(_collect_text(message)).strip()
+    return str(message or "").strip()
+
+
+def _call_azure_openai_chat_completion(
+    *,
+    endpoint: str,
+    api_key: str,
+    deployment: str,
+    api_version: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    timeout_sec: int,
+    enforce_json_response: bool,
+    max_tokens: Optional[int] = None,
+) -> str:
+    base = str(endpoint or "").strip().rstrip("/")
+    if base.lower().endswith("/openai"):
+        base = base[: -len("/openai")]
+    try:
+        parsed_base = urllib.parse.urlparse(base)
+    except Exception:
+        parsed_base = None
+    if parsed_base and parsed_base.scheme and parsed_base.netloc:
+        endpoint_host = parsed_base.netloc
+        # Accept endpoint values copied from OpenAI-style docs (e.g. /openai/v1)
+        # but normalize to Azure resource root for deployment-scoped URL construction.
+        base = f"{parsed_base.scheme}://{parsed_base.netloc}"
+    else:
+        endpoint_host = ""
+    deployment_name = str(deployment or "").strip()
+    version = str(api_version or "").strip()
+    if not base or not deployment_name or not version:
+        raise RuntimeError("Azure OpenAI endpoint/deployment/api_version is required.")
+    if not api_key:
+        raise RuntimeError("Azure OpenAI API key is required.")
+
+    encoded_deployment = urllib.parse.quote(deployment_name, safe="")
+    encoded_version = urllib.parse.quote(version, safe="")
+    url = (
+        f"{base}/openai/deployments/{encoded_deployment}/chat/completions"
+        f"?api-version={encoded_version}"
+    )
+
+    def _send_request(token_key: Optional[str]) -> Dict[str, Any]:
+        body = {
+            "messages": messages,
+            "temperature": float(temperature),
+        }
+        if isinstance(max_tokens, int) and max_tokens > 0 and token_key:
+            body[token_key] = int(max_tokens)
+        if enforce_json_response:
+            body["response_format"] = {"type": "json_object"}
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "api-key": api_key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=max(3, timeout_sec)) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    token_key = "max_completion_tokens"
+    try:
+        payload = _send_request(token_key=token_key)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            detail = ""
+        detail_text = detail.strip() or str(exc)
+        lowered_detail = detail_text.lower()
+        should_retry_with_max_tokens = (
+            exc.code == 400
+            and "unsupported parameter" in lowered_detail
+            and "max_completion_tokens" in lowered_detail
+            and "max_tokens" in lowered_detail
+        )
+        if should_retry_with_max_tokens:
+            try:
+                payload = _send_request(token_key="max_tokens")
+            except urllib.error.HTTPError as retry_exc:
+                retry_detail = ""
+                try:
+                    retry_detail = retry_exc.read().decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    retry_detail = ""
+                retry_detail_text = retry_detail.strip() or str(retry_exc)
+                raise RuntimeError(
+                    f"Azure OpenAI HTTP {retry_exc.code}: {retry_detail_text}"
+                ) from retry_exc
+            except Exception as retry_exc:  # noqa: BLE001
+                raise RuntimeError(f"Azure OpenAI request failed: {retry_exc}") from retry_exc
+        else:
+            if exc.code == 404:
+                raise RuntimeError(
+                    "Azure OpenAI HTTP 404: Resource not found. "
+                    "Check endpoint root, deployment name, and API version. "
+                    f"endpoint_host={endpoint_host or 'unknown'}, deployment={deployment_name}, api_version={version}."
+                ) from exc
+            raise RuntimeError(f"Azure OpenAI HTTP {exc.code}: {detail_text}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Azure OpenAI request failed: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Azure OpenAI response is not a JSON object.")
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("Azure OpenAI response has no choices.")
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        raise RuntimeError("Azure OpenAI response choice is invalid.")
+    message = first_choice.get("message", {})
+    if not isinstance(message, dict):
+        raise RuntimeError("Azure OpenAI response message is invalid.")
+    content = _extract_chat_completion_content(message.get("content"))
+    if not content:
+        content = _extract_chat_completion_content(message.get("output_text"))
+    if not content:
+        content = _extract_chat_completion_content(first_choice.get("text"))
+    if not content:
+        refusal = _extract_chat_completion_content(message.get("refusal"))
+        finish_reason = _normalize_llm_text(first_choice.get("finish_reason"))
+        if refusal:
+            raise RuntimeError(f"Azure OpenAI refusal: {refusal}")
+        if finish_reason:
+            raise RuntimeError(
+                f"Azure OpenAI response content is empty (finish_reason={finish_reason})."
+            )
+    if not content:
+        raise RuntimeError("Azure OpenAI response content is empty.")
+    return content
+
+
+def _route_has_zero_distance_segment(segment_context: List[Dict[str, Any]]) -> bool:
+    for segment in segment_context:
+        if not isinstance(segment, dict):
+            continue
+        distance_km = _safe_float(segment.get("distance_km"), 0.0) or 0.0
+        if distance_km <= 0.0:
+            return True
+    return False
+
+
+def _is_timeout_like_error(error_text: str) -> bool:
+    text = str(error_text or "").strip().lower()
+    return "timed out" in text or "timeout" in text or "time out" in text
+
+
+def _is_non_retryable_llm_error(error_text: str) -> bool:
+    text = str(error_text or "").strip().lower()
+    return (
+        "http 404" in text
+        or "resource not found" in text
+        or "http 401" in text
+        or "http 403" in text
+        or "deploymentnotfound" in text
+        or "invalid api key" in text
+    )
+
+
+def _prepare_segment_payload_for_llm(
+    *,
+    route: Dict[str, Any],
+    route_stop_municipality_links: List[Dict[str, Any]],
+    segment_context: List[Dict[str, Any]],
+    segment: Dict[str, Any],
+) -> Dict[str, Any]:
+    route_stop_names: List[str] = []
+    for stop in route_stop_municipality_links:
+        if not isinstance(stop, dict):
+            continue
+        _append_unique_in_order(route_stop_names, stop.get("municipality_name"))
+
+    full_route_chain: List[str] = []
+    for row in segment_context:
+        if not isinstance(row, dict):
+            continue
+        for name in _normalize_municipality_vector(row.get("municipality_names")):
+            _append_unique_in_order(full_route_chain, name)
+
+    segment_index = (
+        int(segment.get("segment_index"))
+        if isinstance(segment.get("segment_index"), int)
+        else None
+    )
+    current_names = _normalize_municipality_vector(segment.get("municipality_names"))
+    current_roads = _sample_vector_items(
+        _normalize_road_vector(segment.get("road_names")), max_items=10
+    )
+
+    previous_tail = ""
+    next_head = ""
+    if segment_index is not None:
+        previous_segment = next(
+            (
+                row
+                for row in segment_context
+                if isinstance(row, dict) and row.get("segment_index") == segment_index - 1
+            ),
+            None,
+        )
+        next_segment = next(
+            (
+                row
+                for row in segment_context
+                if isinstance(row, dict) and row.get("segment_index") == segment_index + 1
+            ),
+            None,
+        )
+        if isinstance(previous_segment, dict):
+            prev_names = _normalize_municipality_vector(
+                previous_segment.get("municipality_names")
+            )
+            if prev_names:
+                previous_tail = prev_names[-1]
+        if isinstance(next_segment, dict):
+            next_names = _normalize_municipality_vector(next_segment.get("municipality_names"))
+            if next_names:
+                next_head = next_names[0]
+
+    return {
+        "vehicle": route.get("vehicle"),
+        "served_customer_ids": (
+            list(route.get("served_customer_ids", []))
+            if isinstance(route.get("served_customer_ids"), list)
+            else []
+        ),
+        "route_distance_km": route.get("distance_km"),
+        "route_stop_chain": _municipality_chain_label(route_stop_names),
+        "route_municipality_chain_compact": _municipality_chain_label(
+            _sample_vector_items(full_route_chain, max_items=14)
+        ),
+        "segment_index": segment_index,
+        "from_stop_id": segment.get("from_stop_id"),
+        "to_stop_id": segment.get("to_stop_id"),
+        "distance_km": segment.get("distance_km"),
+        "current_municipality_names": current_names,
+        "current_municipality_chain": _municipality_chain_label(current_names),
+        "current_road_names": current_roads,
+        "current_road_chain": _road_chain_label(current_roads),
+        "previous_tail": previous_tail or None,
+        "next_head": next_head or None,
+    }
+
+
+def _build_municipality_segment_llm_messages(
+    prompt_payload: Dict[str, Any], compact: bool
+) -> List[Dict[str, str]]:
+    segment_index = prompt_payload.get("segment_index")
+    segment_label = (
+        f"Segment {int(segment_index) + 1}"
+        if isinstance(segment_index, int)
+        else "Segment ?"
+    )
+    current_names = _normalize_municipality_vector(
+        prompt_payload.get("current_municipality_names")
+    )
+    if compact:
+        sampled_names: List[str] = []
+        if current_names:
+            sampled_names.append(current_names[0])
+            if len(current_names) > 2:
+                sampled_names.append(current_names[len(current_names) // 2])
+            if len(current_names) > 1:
+                sampled_names.append(current_names[-1])
+        current_chain = _municipality_chain_label(sampled_names)
+        roads = _sample_vector_items(prompt_payload.get("current_road_names"), max_items=3)
+    else:
+        current_chain = _municipality_chain_label(current_names)
+        roads = _sample_vector_items(prompt_payload.get("current_road_names"), max_items=6)
+    road_chain = _road_chain_label(roads)
+    mode_line = "compact" if compact else "standard"
+    system_prompt = (
+        "Return compact JSON only. Do not explain. "
+        "Keep municipality order and only insert plausible no-detour additions."
+    )
+    user_prompt = (
+        "Task: update one segment municipality sequence.\n"
+        "Constraints:\n"
+        "- Keep first and last municipality unchanged.\n"
+        "- Keep existing order; only insert missing municipalities.\n"
+        "- Use road hints and adjacent segment boundary hints.\n"
+        "- Spanish municipality names, concise output.\n"
+        "Output JSON schema:\n"
+        '{"segment_index":0,"municipality_names":["A","B"],'
+        '"added_municipalities":[{"name":"X","reason":"short"}]}\n'
+        f"mode={mode_line}\n"
+        f"segment_index={segment_index}\n"
+        f"from_stop_id={prompt_payload.get('from_stop_id')}\n"
+        f"to_stop_id={prompt_payload.get('to_stop_id')}\n"
+        f"distance_km={prompt_payload.get('distance_km')}\n"
+        f"current_municipalities={current_chain}\n"
+        f"current_roads={road_chain}\n"
+        f"prev_tail={prompt_payload.get('previous_tail') or 'n/a'}\n"
+        f"next_head={prompt_payload.get('next_head') or 'n/a'}\n"
+        f"route_stops={prompt_payload.get('route_stop_chain')}\n"
+        f"segment_label={segment_label}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _parse_segment_llm_response(
+    llm_payload: Dict[str, Any],
+    *,
+    segment_index: int,
+    canonical_by_key: Dict[str, str],
+    original_municipality_names: List[str],
+) -> Dict[str, Any]:
+    raw_names = _normalize_municipality_vector(llm_payload.get("municipality_names"))
+    if not raw_names:
+        raw_segments = llm_payload.get("segment_context")
+        if isinstance(raw_segments, list):
+            for row in raw_segments:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("segment_index") != segment_index:
+                    continue
+                raw_names = _normalize_municipality_vector(row.get("municipality_names"))
+                if raw_names:
+                    break
+    if not raw_names:
+        raise ValueError("LLM response does not contain municipality_names.")
+
+    repaired_names = [
+        _repair_name_from_candidates(name, canonical_by_key) for name in raw_names
+    ]
+    repaired_names = _normalize_municipality_vector(repaired_names)
+    if not repaired_names:
+        raise ValueError("LLM response municipality_names are empty after normalization.")
+
+    if original_municipality_names:
+        start_name = original_municipality_names[0]
+        end_name = original_municipality_names[-1]
+        start_key = _canonical_name_key(start_name)
+        end_key = _canonical_name_key(end_name)
+        if start_key and (
+            not repaired_names or _canonical_name_key(repaired_names[0]) != start_key
+        ):
+            repaired_names = [
+                start_name,
+                *[
+                    name
+                    for name in repaired_names
+                    if _canonical_name_key(name) != start_key
+                ],
+            ]
+        if end_key and (
+            not repaired_names or _canonical_name_key(repaired_names[-1]) != end_key
+        ):
+            repaired_names = [
+                *[
+                    name
+                    for name in repaired_names
+                    if _canonical_name_key(name) != end_key
+                ],
+                end_name,
+            ]
+        repaired_names = _normalize_municipality_vector(repaired_names)
+
+    original_keys = {
+        _canonical_name_key(name)
+        for name in original_municipality_names
+        if _canonical_name_key(name)
+    }
+    added: List[Dict[str, Any]] = []
+    raw_added = llm_payload.get("added_municipalities")
+    if isinstance(raw_added, list):
+        for item in raw_added[:20]:
+            if not isinstance(item, dict):
+                continue
+            raw_name = _normalize_llm_text(item.get("name"))
+            if not raw_name:
+                continue
+            fixed_name = _repair_name_from_candidates(raw_name, canonical_by_key)
+            fixed_key = _canonical_name_key(fixed_name)
+            if fixed_key and fixed_key in original_keys:
+                continue
+            added.append(
+                {
+                    "name": fixed_name,
+                    "segment_index": segment_index,
+                    "reason": _normalize_llm_text(item.get("reason")) or None,
+                }
+            )
+
+    repaired_names = _inject_added_names_into_segment_sequence(repaired_names, added)
+
+    return {
+        "segment_index": segment_index,
+        "municipality_names": repaired_names,
+        "added_municipalities": added,
+    }
+
+
+def _inject_added_names_into_segment_sequence(
+    municipality_names: List[str], added_rows: List[Dict[str, Any]]
+) -> List[str]:
+    """Ensure explicit LLM additions appear in the segment sequence.
+
+    If the model reports names in ``added_municipalities`` but omits them from
+    ``municipality_names``, inject them in-order right before the segment tail
+    municipality. This preserves start/end anchors while surfacing additions in
+    downstream vectors and UI.
+    """
+    names = _normalize_municipality_vector(municipality_names)
+    if len(names) < 2 or not isinstance(added_rows, list):
+        return names
+
+    seen_keys = {
+        _canonical_name_key(name)
+        for name in names
+        if _canonical_name_key(name)
+    }
+    insert_index = max(1, len(names) - 1)
+    for row in added_rows:
+        if not isinstance(row, dict):
+            continue
+        candidate = _normalize_llm_text(row.get("name"))
+        if not candidate:
+            continue
+        candidate_key = _canonical_name_key(candidate)
+        if not candidate_key or candidate_key in seen_keys:
+            continue
+        names.insert(insert_index, candidate)
+        insert_index += 1
+        seen_keys.add(candidate_key)
+    return _normalize_municipality_vector(names)
+
+
+def _enrich_route_municipality_vectors_with_llm(
+    *,
+    route: Dict[str, Any],
+    route_stop_municipality_links: List[Dict[str, Any]],
+    segment_context: List[Dict[str, Any]],
+    endpoint: str,
+    api_key: str,
+    deployment: str,
+    api_version: str,
+    timeout_sec: int,
+    retries: int,
+    max_tokens: int,
+    debug_first_route: bool,
+) -> Dict[str, Any]:
+    canonical_by_key: Dict[str, str] = {}
+    route_fatal_error: Optional[str] = None
+    for segment in segment_context:
+        if not isinstance(segment, dict):
+            continue
+        for name in _normalize_municipality_vector(segment.get("municipality_names")):
+            key = _canonical_name_key(name)
+            if key and key not in canonical_by_key:
+                canonical_by_key[key] = name
+
+    segment_vectors: Dict[int, List[str]] = {}
+    added_municipalities: List[Dict[str, Any]] = []
+    segment_errors: List[str] = []
+    segment_max_tokens_base = max(1200, min(int(max_tokens), 6000))
+    attempted_segments = 0
+    enriched_segments = 0
+    failed_segments = 0
+
+    for segment in segment_context:
+        if not isinstance(segment, dict):
+            continue
+        segment_index = segment.get("segment_index")
+        if not isinstance(segment_index, int):
+            continue
+        original_names = _normalize_municipality_vector(segment.get("municipality_names"))
+        if len(original_names) < 2:
+            continue
+        attempted_segments += 1
+
+        prompt_payload = _prepare_segment_payload_for_llm(
+            route=route,
+            route_stop_municipality_links=route_stop_municipality_links,
+            segment_context=segment_context,
+            segment=segment,
+        )
+        messages = _build_municipality_segment_llm_messages(prompt_payload, compact=False)
+        debug_prefix = f"[municipality-llm][route-1][segment-{segment_index + 1}]"
+
+        if debug_first_route:
+            _safe_console_print(f"{debug_prefix}[prompt]")
+            _safe_console_print(
+                json.dumps(
+                    {
+                        "messages": messages,
+                        "temperature": MUNICIPALITY_LLM_TEMPERATURE,
+                        "max_tokens": segment_max_tokens_base,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        last_error: Optional[str] = None
+        response_text: Optional[str] = None
+        enforce_json_response = True
+        max_attempts = 1 + max(0, int(retries))
+        attempt_max_tokens = segment_max_tokens_base
+        for attempt in range(max_attempts):
+            try:
+                response_text = _call_azure_openai_chat_completion(
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    deployment=deployment,
+                    api_version=api_version,
+                    messages=messages,
+                    temperature=MUNICIPALITY_LLM_TEMPERATURE,
+                    timeout_sec=timeout_sec,
+                    enforce_json_response=enforce_json_response,
+                    max_tokens=attempt_max_tokens,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                lowered_error = last_error.lower()
+                if enforce_json_response and (
+                    "response_format" in lowered_error
+                    or "json_object" in lowered_error
+                ):
+                    enforce_json_response = False
+                if "finish_reason=length" in lowered_error and attempt_max_tokens < 6000:
+                    attempt_max_tokens = min(6000, max(attempt_max_tokens + 800, int(attempt_max_tokens * 1.8)))
+                if debug_first_route:
+                    _safe_console_print(
+                        f"{debug_prefix}[attempt-{attempt + 1}-error][max_tokens={attempt_max_tokens}] {last_error}"
+                    )
+                if _is_non_retryable_llm_error(last_error):
+                    break
+                if attempt + 1 < max_attempts:
+                    time.sleep(0.25 * (attempt + 1))
+
+        compact_error: Optional[str] = None
+        empty_content_error = "content is empty" in str(last_error or "").strip().lower()
+        timeout_like_error = _is_timeout_like_error(last_error or "")
+        should_try_compact_fallback = timeout_like_error or empty_content_error
+        if response_text is None and should_try_compact_fallback:
+            compact_messages = _build_municipality_segment_llm_messages(
+                prompt_payload, compact=True
+            )
+            if timeout_like_error:
+                compact_max_tokens = max(500, min(1500, int(attempt_max_tokens * 0.5)))
+            else:
+                compact_max_tokens = max(900, min(3000, int(attempt_max_tokens)))
+            compact_force_json = not empty_content_error
+            if debug_first_route:
+                _safe_console_print(f"{debug_prefix}[fallback-compact][prompt]")
+                _safe_console_print(
+                    json.dumps(
+                        {
+                            "messages": compact_messages,
+                            "temperature": MUNICIPALITY_LLM_TEMPERATURE,
+                            "max_tokens": compact_max_tokens,
+                            "enforce_json_response": compact_force_json,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            try:
+                response_text = _call_azure_openai_chat_completion(
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    deployment=deployment,
+                    api_version=api_version,
+                    messages=compact_messages,
+                    temperature=MUNICIPALITY_LLM_TEMPERATURE,
+                    timeout_sec=max(20, timeout_sec),
+                    enforce_json_response=compact_force_json,
+                    max_tokens=compact_max_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001
+                compact_error = str(exc)
+                lowered_compact_error = compact_error.lower()
+                if (
+                    "finish_reason=length" in lowered_compact_error
+                    and compact_max_tokens < 6000
+                ):
+                    compact_retry_tokens = min(6000, max(compact_max_tokens + 1200, int(compact_max_tokens * 1.8)))
+                    try:
+                        response_text = _call_azure_openai_chat_completion(
+                            endpoint=endpoint,
+                            api_key=api_key,
+                            deployment=deployment,
+                            api_version=api_version,
+                            messages=compact_messages,
+                            temperature=MUNICIPALITY_LLM_TEMPERATURE,
+                            timeout_sec=max(20, timeout_sec),
+                            enforce_json_response=compact_force_json,
+                            max_tokens=compact_retry_tokens,
+                        )
+                    except Exception as retry_exc:  # noqa: BLE001
+                        compact_error = str(retry_exc)
+                        if debug_first_route:
+                            _safe_console_print(
+                                f"{debug_prefix}[fallback-compact][retry-error][max_tokens={compact_retry_tokens}] {compact_error}"
+                            )
+                if response_text is None and debug_first_route:
+                    _safe_console_print(
+                        f"{debug_prefix}[fallback-compact][error] {compact_error}"
+                    )
+
+        if response_text is None:
+            error_text = (
+                f"{last_error or 'Azure OpenAI returned no response.'} | "
+                f"compact_fallback: {compact_error}"
+                if compact_error
+                else (last_error or "Azure OpenAI returned no response.")
+            )
+            segment_errors.append(f"segment={segment_index + 1}: {error_text}")
+            failed_segments += 1
+            if _is_non_retryable_llm_error(error_text):
+                route_fatal_error = error_text
+                break
+            continue
+
+        if debug_first_route:
+            _safe_console_print(f"{debug_prefix}[response]")
+            _safe_console_print(response_text)
+
+        parsed_payload = _extract_json_object(response_text)
+        if not isinstance(parsed_payload, dict):
+            segment_errors.append(
+                f"segment={segment_index + 1}: LLM response is not valid JSON object."
+            )
+            failed_segments += 1
+            continue
+        try:
+            parsed_segment = _parse_segment_llm_response(
+                parsed_payload,
+                segment_index=segment_index,
+                canonical_by_key=canonical_by_key,
+                original_municipality_names=original_names,
+            )
+        except Exception as exc:  # noqa: BLE001
+            segment_errors.append(f"segment={segment_index + 1}: {exc}")
+            failed_segments += 1
+            continue
+
+        names = _normalize_municipality_vector(parsed_segment.get("municipality_names"))
+        if names:
+            segment_vectors[segment_index] = names
+            for municipality_name in names:
+                key = _canonical_name_key(municipality_name)
+                if key and key not in canonical_by_key:
+                    canonical_by_key[key] = municipality_name
+            enriched_segments += 1
+        for item in parsed_segment.get("added_municipalities", []):
+            if not isinstance(item, dict):
+                continue
+            if len(added_municipalities) >= 40:
+                break
+            added_municipalities.append(item)
+
+    if route_fatal_error and not segment_vectors:
+        return {
+            "status": "error",
+            "error": route_fatal_error,
+            "attempted_segments": attempted_segments,
+            "enriched_segments": enriched_segments,
+            "failed_segments": failed_segments,
+        }
+    if not segment_vectors:
+        return {
+            "status": "error",
+            "error": (
+                "; ".join(segment_errors[:6])
+                if segment_errors
+                else "LLM response does not contain segment updates."
+            ),
+            "attempted_segments": attempted_segments,
+            "enriched_segments": enriched_segments,
+            "failed_segments": failed_segments,
+        }
+
+    route_vector: List[str] = []
+    for segment in segment_context:
+        if not isinstance(segment, dict):
+            continue
+        segment_index = segment.get("segment_index")
+        if not isinstance(segment_index, int):
+            continue
+        names = segment_vectors.get(
+            segment_index,
+            _normalize_municipality_vector(segment.get("municipality_names")),
+        )
+        for municipality_name in names:
+            _append_unique_in_order(route_vector, municipality_name)
+
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "route_municipality_vector": route_vector,
+        "segment_vectors": segment_vectors,
+        "added_municipalities": added_municipalities[:40],
+        "attempted_segments": attempted_segments,
+        "enriched_segments": enriched_segments,
+        "failed_segments": failed_segments,
+    }
+    if segment_errors:
+        result["warnings"] = segment_errors[:20]
+    return result
 
 
 def _new_point_registry_entry(lat: float, lng: float, coord_key: str) -> Dict[str, Any]:
@@ -1116,12 +2052,54 @@ def _sample_segment_points(
     return samples
 
 
+def _extract_osrm_step_road_names(route_row: Dict[str, Any]) -> List[str]:
+    if not isinstance(route_row, dict):
+        return []
+    roads: List[str] = []
+    seen_keys: Set[str] = set()
+    legs = route_row.get("legs")
+    if not isinstance(legs, list):
+        return roads
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        steps = leg.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            road_name = _normalize_llm_text(step.get("name"))
+            road_ref = _normalize_llm_text(step.get("ref"))
+            if road_ref and road_name:
+                if _canonical_name_key(road_ref) == _canonical_name_key(road_name):
+                    label = road_ref
+                else:
+                    label = f"{road_ref} ({road_name})"
+            else:
+                label = road_ref or road_name
+            label = _normalize_llm_text(label)
+            if not label:
+                continue
+            lowered = label.casefold()
+            if lowered in {"unnamed road", "road", "unknown road", "n/a"}:
+                continue
+            key = _canonical_name_key(label) or lowered
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            roads.append(label)
+            if len(roads) >= 30:
+                return roads
+    return roads
+
+
 def _fetch_osrm_segment_geometry(
     start: Dict[str, float],
     end: Dict[str, float],
     osrm_base_url: str,
     timeout_sec: int,
-) -> List[Dict[str, float]]:
+) -> Dict[str, Any]:
     start_lat = _safe_float(start.get("lat"))
     start_lng = _safe_float(start.get("lng"))
     end_lat = _safe_float(end.get("lat"))
@@ -1133,6 +2111,14 @@ def _fetch_osrm_segment_geometry(
         or end_lng is None
     ):
         raise RuntimeError("Invalid coordinates for OSRM route geometry.")
+    if abs(start_lat - end_lat) < 1e-9 and abs(start_lng - end_lng) < 1e-9:
+        return {
+            "points": [
+                {"lat": float(start_lat), "lng": float(start_lng)},
+                {"lat": float(end_lat), "lng": float(end_lng)},
+            ],
+            "road_names": [],
+        }
 
     coords = f"{start_lng},{start_lat};{end_lng},{end_lat}"
     encoded_coords = urllib.parse.quote(coords, safe=";,")
@@ -1141,7 +2127,7 @@ def _fetch_osrm_segment_geometry(
         raise RuntimeError("OSRM base URL is empty.")
     url = (
         f"{base}/route/v1/driving/{encoded_coords}"
-        "?overview=full&geometries=geojson&steps=false"
+        "?overview=full&geometries=geojson&steps=true"
     )
 
     payload = None
@@ -1165,7 +2151,10 @@ def _fetch_osrm_segment_geometry(
     routes = payload.get("routes")
     if not isinstance(routes, list) or not routes:
         raise RuntimeError("OSRM geometry missing routes.")
-    geometry = routes[0].get("geometry", {})
+    first_route = routes[0]
+    if not isinstance(first_route, dict):
+        raise RuntimeError("OSRM geometry first route invalid.")
+    geometry = first_route.get("geometry", {})
     if not isinstance(geometry, dict):
         raise RuntimeError("OSRM geometry object missing.")
     coordinates = geometry.get("coordinates")
@@ -1185,7 +2174,11 @@ def _fetch_osrm_segment_geometry(
         points.append({"lat": lat, "lng": lng})
     if len(points) < 2:
         raise RuntimeError("OSRM geometry has insufficient valid points.")
-    return points
+    road_names = _extract_osrm_step_road_names(first_route)
+    return {
+        "points": points,
+        "road_names": road_names,
+    }
 
 
 def _sample_polyline_points(
@@ -1825,12 +2818,21 @@ def _semantic_locations_for_route(
     radius_km: float,
     semantic_categories: Set[str],
     top_k: int,
+    stop_exclusion_km: float = 8.0,
 ) -> List[Dict[str, Any]]:
     stops = route.get("stops", [])
     if len(stops) < 2 or not candidate_locations:
         return []
 
     scored = []
+    near_stop_scored = []
+    stop_points: List[Tuple[float, float]] = []
+    for stop in stops:
+        lat = _safe_float(stop.get("lat"))
+        lng = _safe_float(stop.get("lng"))
+        if lat is None or lng is None:
+            continue
+        stop_points.append((lat, lng))
     for location in candidate_locations:
         distance_km, nearest_segment_index = _distance_to_route_km(location, stops)
         if math.isinf(distance_km) or distance_km > radius_km:
@@ -1838,21 +2840,57 @@ def _semantic_locations_for_route(
 
         category = location["semantic_category"]
         score = _score_location(distance_km, radius_km, category, semantic_categories)
-        scored.append(
-            {
-                "id": location["id"],
-                "name": location.get("name"),
-                "lat": location["lat"],
-                "lng": location["lng"],
-                "source": location.get("source"),
-                "semantic_category": category,
-                "distance_to_route_km": round(distance_km, 3),
-                "estimated_detour_km": round(distance_km * 2.0, 3),
-                "nearest_segment_index": nearest_segment_index,
-                "relevance_score": round(score, 4),
-                "tags": location.get("tags", {}),
-            }
+        nearest_stop_distance_km = min(
+            (_haversine_km((location["lat"], location["lng"]), stop) for stop in stop_points),
+            default=float("inf"),
         )
+        normalized_location = {
+            "id": location["id"],
+            "name": location.get("name"),
+            "lat": location["lat"],
+            "lng": location["lng"],
+            "source": location.get("source"),
+            "semantic_category": category,
+            "distance_to_route_km": round(distance_km, 3),
+            "estimated_detour_km": round(distance_km * 2.0, 3),
+            "nearest_segment_index": nearest_segment_index,
+            "distance_to_nearest_stop_km": (
+                round(nearest_stop_distance_km, 3)
+                if not math.isinf(nearest_stop_distance_km)
+                else None
+            ),
+            "relevance_score": round(score, 4),
+            "tags": location.get("tags", {}),
+        }
+        if stop_exclusion_km > 0 and nearest_stop_distance_km < stop_exclusion_km:
+            near_stop_scored.append(normalized_location)
+        else:
+            scored.append(normalized_location)
+
+    # Prefer POIs away from stop hubs (city centers). If all are near stops,
+    # gracefully fall back instead of returning an empty set.
+    if not scored and near_stop_scored:
+        scored = near_stop_scored
+    elif len(scored) < top_k and near_stop_scored:
+        # Backfill with near-stop POIs starting from the ones furthest from
+        # stops, so we increase quantity without returning to city-center bias.
+        near_stop_scored.sort(
+            key=lambda item: (
+                -(item.get("distance_to_nearest_stop_km") or 0.0),
+                -item["relevance_score"],
+                item["distance_to_route_km"],
+                str(item["id"]),
+            )
+        )
+        scored_ids = {str(item.get("id")) for item in scored}
+        for item in near_stop_scored:
+            item_id = str(item.get("id"))
+            if item_id in scored_ids:
+                continue
+            scored.append(item)
+            scored_ids.add(item_id)
+            if len(scored) >= top_k:
+                break
 
     scored.sort(
         key=lambda item: (
@@ -1861,7 +2899,54 @@ def _semantic_locations_for_route(
             str(item["id"]),
         )
     )
-    return scored[:top_k]
+    if len(scored) <= top_k:
+        return scored
+
+    # Keep one high-scoring location per segment first, then fill remaining
+    # slots with a soft segment cap. This avoids UI clustering around one area.
+    selected: List[Dict[str, Any]] = []
+    selected_ids: Set[str] = set()
+    covered_segments: Set[int] = set()
+    unique_segments = {
+        _safe_int(item.get("nearest_segment_index"), -1) for item in scored
+    }
+    segment_count = max(1, len(unique_segments))
+    segment_cap = max(1, int(math.ceil(top_k / float(segment_count))))
+    per_segment_count: Dict[int, int] = {}
+    for item in scored:
+        segment_index = _safe_int(item.get("nearest_segment_index"), -1)
+        if segment_index in covered_segments:
+            continue
+        selected.append(item)
+        selected_ids.add(str(item.get("id")))
+        covered_segments.add(segment_index)
+        per_segment_count[segment_index] = per_segment_count.get(segment_index, 0) + 1
+        if len(selected) >= top_k:
+            return selected
+
+    for item in scored:
+        item_id = str(item.get("id"))
+        if item_id in selected_ids:
+            continue
+        segment_index = _safe_int(item.get("nearest_segment_index"), -1)
+        if per_segment_count.get(segment_index, 0) >= segment_cap:
+            continue
+        selected.append(item)
+        selected_ids.add(item_id)
+        per_segment_count[segment_index] = per_segment_count.get(segment_index, 0) + 1
+        if len(selected) >= top_k:
+            break
+
+    if len(selected) < top_k:
+        for item in scored:
+            item_id = str(item.get("id"))
+            if item_id in selected_ids:
+                continue
+            selected.append(item)
+            selected_ids.add(item_id)
+            if len(selected) >= top_k:
+                break
+    return selected
 
 
 def build_semantic_layer(
@@ -1877,6 +2962,10 @@ def build_semantic_layer(
 
     top_k = _safe_int(raw_payload.get("semantic_top_k"), DEFAULT_TOP_K)
     top_k = max(1, top_k)
+    stop_exclusion_km = _safe_float(raw_payload.get("semantic_stop_exclusion_km"))
+    if stop_exclusion_km is None:
+        stop_exclusion_km = 8.0
+    stop_exclusion_km = max(0.0, stop_exclusion_km)
 
     avg_speed_kmh = _safe_float(raw_payload.get("route_avg_speed_kmh"))
     if avg_speed_kmh is None:
@@ -1982,6 +3071,56 @@ def build_semantic_layer(
     municipality_use_route_geometry = _safe_bool(
         raw_payload.get("municipality_use_route_geometry"), True
     )
+    municipality_llm_enrichment_requested = _safe_bool(
+        raw_payload.get("municipality_llm_enrichment_enabled"), True
+    )
+    municipality_llm_enrichment_enabled = (
+        municipality_enrichment_enabled and municipality_llm_enrichment_requested
+    )
+    municipality_llm_timeout_sec = max(
+        3,
+        _safe_int(
+            raw_payload.get("municipality_llm_timeout_sec"),
+            DEFAULT_MUNICIPALITY_LLM_TIMEOUT_SEC,
+        ),
+    )
+    municipality_llm_retries = max(
+        0,
+        _safe_int(
+            raw_payload.get("municipality_llm_retries"),
+            DEFAULT_MUNICIPALITY_LLM_RETRIES,
+        ),
+    )
+    municipality_llm_max_tokens = max(
+        200,
+        _safe_int(
+            raw_payload.get("municipality_llm_max_tokens"),
+            DEFAULT_MUNICIPALITY_LLM_MAX_TOKENS,
+        ),
+    )
+    azure_openai_endpoint = str(
+        raw_payload.get("azure_openai_endpoint")
+        or raw_payload.get("municipality_llm_endpoint")
+        or os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    ).strip()
+    azure_openai_api_key = str(
+        raw_payload.get("azure_openai_api_key")
+        or raw_payload.get("municipality_llm_api_key")
+        or os.getenv("AZURE_OPENAI_API_KEY", "")
+    ).strip()
+    azure_openai_deployment = str(
+        raw_payload.get("azure_openai_deployment")
+        or raw_payload.get("municipality_llm_deployment")
+        or os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
+    ).strip()
+    azure_openai_api_version = str(
+        raw_payload.get("azure_openai_api_version")
+        or raw_payload.get("municipality_llm_api_version")
+        or os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
+    ).strip() or DEFAULT_AZURE_OPENAI_API_VERSION
+    municipality_llm_configured = bool(
+        azure_openai_endpoint and azure_openai_api_key and azure_openai_deployment
+    )
     distance_source = str(
         (vrp_result.get("summary", {}) if isinstance(vrp_result, dict) else {}).get(
             "distance_source", ""
@@ -2018,6 +3157,8 @@ def build_semantic_layer(
     here_errors: List[str] = []
     municipality_records = 0
     municipality_errors: List[str] = []
+    municipality_llm_errors: List[str] = []
+    municipality_llm_added_report: List[Dict[str, Any]] = []
     province_capital_errors: List[str] = []
     municipality_phase1_points: Dict[str, Dict[str, Any]] = {}
     municipality_phase2_points: Dict[str, Dict[str, Any]] = {}
@@ -2028,13 +3169,14 @@ def build_semantic_layer(
         timeout_sec=municipality_timeout_sec,
         min_interval_ms=municipality_reverse_min_interval_ms,
     )
-    segment_shape_cache: Dict[Tuple[str, str], Optional[List[Dict[str, float]]]] = {}
+    segment_shape_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
     segment_shape_stats: Dict[str, Any] = {
         "enabled": municipality_route_geometry_enabled,
         "attempted": 0,
         "fetched": 0,
         "cache_hits": 0,
         "failed": 0,
+        "skipped_identical_endpoints": 0,
         "fallback_to_straight": 0,
     }
     municipality_address_book: Dict[str, Dict[str, Any]] = municipality_lookup["book"]
@@ -2080,6 +3222,34 @@ def build_semantic_layer(
         },
         "errors": [],
     }
+    municipality_llm_report: Dict[str, Any] = {
+        "enabled": municipality_llm_enrichment_enabled,
+        "configured": municipality_llm_configured,
+        "status": "disabled",
+        "message": (
+            "Municipality LLM enrichment disabled."
+            if not municipality_llm_enrichment_enabled
+            else (
+                "Municipality LLM enrichment is enabled."
+                if municipality_llm_configured
+                else "Municipality LLM enrichment skipped because Azure OpenAI config is incomplete."
+            )
+        ),
+        "temperature": MUNICIPALITY_LLM_TEMPERATURE,
+        "retries": municipality_llm_retries,
+        "max_tokens": municipality_llm_max_tokens,
+        "attempted_routes": 0,
+        "enriched_routes": 0,
+        "skipped_routes": 0,
+        "failed_routes": 0,
+        "attempted_segments": 0,
+        "enriched_segments": 0,
+        "failed_segments": 0,
+        "skipped_reasons": [],
+        "errors": [],
+        "added_municipalities_by_route": [],
+    }
+    municipality_api["llm"] = municipality_llm_report
     if municipality_enrichment_enabled:
         municipality_phase1_points = _collect_problem_coordinates(vrp_result, raw_payload)
         phase1_snapshot_before = _lookup_snapshot(municipality_lookup)
@@ -2131,7 +3301,7 @@ def build_semantic_layer(
         )
         phase2_snapshot_before = _lookup_snapshot(municipality_lookup)
 
-    for route in vrp_result.get("routes", []):
+    for route_index, route in enumerate(vrp_result.get("routes", [])):
         stops = route.get("stops", [])
         segments = _build_route_segments(stops, avg_speed_kmh, departure_time_utc)
         route_stop_municipality_links = (
@@ -2142,12 +3312,27 @@ def build_semantic_layer(
         route_municipality_vector: List[str] = []
         route_province_vector: List[str] = []
         route_province_capital_vector: List[str] = []
+        route_road_vector: List[str] = []
+        route_llm_summary: Dict[str, Any] = {
+            "status": "disabled",
+            "reason": (
+                "llm_disabled"
+                if not municipality_llm_enrichment_enabled
+                else (
+                    "llm_not_configured"
+                    if not municipality_llm_configured
+                    else "pending"
+                )
+            ),
+            "added_municipalities": [],
+        }
         semantic_locations = _semantic_locations_for_route(
             route,
             candidate_locations,
             radius_km,
             semantic_categories,
             top_k,
+            stop_exclusion_km=stop_exclusion_km,
         )
 
         segment_context = []
@@ -2249,6 +3434,7 @@ def build_semantic_layer(
             segment_municipality_vector: List[str] = []
             segment_province_vector: List[str] = []
             segment_province_capital_vector: List[str] = []
+            segment_road_vector: List[str] = []
             if municipality_enrichment_enabled:
                 route_shape_points: Optional[List[Dict[str, float]]] = None
                 if municipality_route_geometry_enabled:
@@ -2260,27 +3446,68 @@ def build_semantic_layer(
                     )
                     shape_cache_key = (start_key, end_key)
                     if shape_cache_key in segment_shape_cache:
-                        route_shape_points = segment_shape_cache[shape_cache_key]
+                        cached_shape = segment_shape_cache[shape_cache_key]
+                        if isinstance(cached_shape, dict):
+                            cached_points = cached_shape.get("points")
+                            if isinstance(cached_points, list):
+                                route_shape_points = cached_points
+                            segment_road_vector = _normalize_road_vector(
+                                cached_shape.get("road_names")
+                            )
+                        else:
+                            route_shape_points = None
                         segment_shape_stats["cache_hits"] += 1
                     else:
-                        segment_shape_stats["attempted"] += 1
-                        try:
-                            route_shape_points = _fetch_osrm_segment_geometry(
-                                start=segment["start"],
-                                end=segment["end"],
-                                osrm_base_url=osrm_base_url,
-                                timeout_sec=municipality_route_geometry_timeout_sec,
-                            )
-                            segment_shape_cache[shape_cache_key] = route_shape_points
-                            segment_shape_stats["fetched"] += 1
-                        except Exception as exc:  # noqa: BLE001
-                            route_shape_points = None
-                            segment_shape_cache[shape_cache_key] = None
-                            segment_shape_stats["failed"] += 1
-                            municipality_errors.append(
-                                "municipality geometry fetch failed "
-                                f"({start_key}->{end_key}): {exc}"
-                            )
+                        if start_key == end_key:
+                            route_shape_points = [
+                                {
+                                    "lat": float(segment["start"]["lat"]),
+                                    "lng": float(segment["start"]["lng"]),
+                                },
+                                {
+                                    "lat": float(segment["end"]["lat"]),
+                                    "lng": float(segment["end"]["lng"]),
+                                },
+                            ]
+                            segment_shape_cache[shape_cache_key] = {
+                                "points": route_shape_points,
+                                "road_names": [],
+                            }
+                            segment_shape_stats["skipped_identical_endpoints"] += 1
+                        else:
+                            segment_shape_stats["attempted"] += 1
+                            try:
+                                osrm_shape = _fetch_osrm_segment_geometry(
+                                    start=segment["start"],
+                                    end=segment["end"],
+                                    osrm_base_url=osrm_base_url,
+                                    timeout_sec=municipality_route_geometry_timeout_sec,
+                                )
+                                if not isinstance(osrm_shape, dict):
+                                    raise RuntimeError(
+                                        "OSRM shape response is not a dictionary."
+                                    )
+                                route_shape_points = (
+                                    osrm_shape.get("points")
+                                    if isinstance(osrm_shape.get("points"), list)
+                                    else None
+                                )
+                                segment_road_vector = _normalize_road_vector(
+                                    osrm_shape.get("road_names")
+                                )
+                                segment_shape_cache[shape_cache_key] = {
+                                    "points": route_shape_points,
+                                    "road_names": segment_road_vector,
+                                }
+                                segment_shape_stats["fetched"] += 1
+                            except Exception as exc:  # noqa: BLE001
+                                route_shape_points = None
+                                segment_shape_cache[shape_cache_key] = None
+                                segment_shape_stats["failed"] += 1
+                                municipality_errors.append(
+                                    "municipality geometry fetch failed "
+                                    f"({start_key}->{end_key}): {exc}"
+                                )
                     if route_shape_points is None:
                         segment_shape_stats["fallback_to_straight"] += 1
 
@@ -2311,6 +3538,8 @@ def build_semantic_layer(
                     _append_unique_in_order(route_province_vector, province_name)
                 for capital_name in segment_province_capital_vector:
                     _append_unique_in_order(route_province_capital_vector, capital_name)
+                for road_name in segment_road_vector:
+                    _append_unique_in_order(route_road_vector, road_name)
             municipality_records += len(municipality_trace)
 
             segment_context.append(
@@ -2327,6 +3556,7 @@ def build_semantic_layer(
                     "municipality_names": segment_municipality_vector,
                     "province_names": segment_province_vector,
                     "province_capital_names": segment_province_capital_vector,
+                    "road_names": segment_road_vector,
                     "weather": weather_context,
                     "traffic": traffic_context,
                 }
@@ -2342,6 +3572,173 @@ def build_semantic_layer(
             location["weather"] = linked.get("weather")
             location["traffic"] = linked.get("traffic")
 
+        if municipality_llm_enrichment_enabled and municipality_llm_configured:
+            debug_first_route = route_index == 0
+            served_customer_ids = route.get("served_customer_ids")
+            has_served_customers = (
+                isinstance(served_customer_ids, list) and len(served_customer_ids) > 0
+            )
+            has_zero_distance_segment = _route_has_zero_distance_segment(segment_context)
+            if not has_served_customers:
+                route_llm_summary = {
+                    "status": "skipped",
+                    "reason": "empty_route_no_served_customers",
+                    "added_municipalities": [],
+                }
+                municipality_llm_report["skipped_routes"] += 1
+                if len(municipality_llm_report["skipped_reasons"]) < 40:
+                    municipality_llm_report["skipped_reasons"].append(
+                        {
+                            "vehicle": route.get("vehicle"),
+                            "reason": route_llm_summary["reason"],
+                        }
+                    )
+                if debug_first_route:
+                    _safe_console_print(
+                        "[municipality-llm][route-1][skip] "
+                        "empty_route_no_served_customers"
+                    )
+            elif has_zero_distance_segment:
+                route_llm_summary = {
+                    "status": "skipped",
+                    "reason": "contains_zero_distance_segment",
+                    "added_municipalities": [],
+                }
+                municipality_llm_report["skipped_routes"] += 1
+                if len(municipality_llm_report["skipped_reasons"]) < 40:
+                    municipality_llm_report["skipped_reasons"].append(
+                        {
+                            "vehicle": route.get("vehicle"),
+                            "reason": route_llm_summary["reason"],
+                        }
+                    )
+                if debug_first_route:
+                    _safe_console_print(
+                        "[municipality-llm][route-1][skip] contains_zero_distance_segment"
+                    )
+            else:
+                municipality_llm_report["attempted_routes"] += 1
+                llm_result = _enrich_route_municipality_vectors_with_llm(
+                    route=route,
+                    route_stop_municipality_links=route_stop_municipality_links,
+                    segment_context=segment_context,
+                    endpoint=azure_openai_endpoint,
+                    api_key=azure_openai_api_key,
+                    deployment=azure_openai_deployment,
+                    api_version=azure_openai_api_version,
+                    timeout_sec=municipality_llm_timeout_sec,
+                    retries=municipality_llm_retries,
+                    max_tokens=municipality_llm_max_tokens,
+                    debug_first_route=debug_first_route,
+                )
+                municipality_llm_report["attempted_segments"] += int(
+                    llm_result.get("attempted_segments", 0)
+                )
+                municipality_llm_report["enriched_segments"] += int(
+                    llm_result.get("enriched_segments", 0)
+                )
+                municipality_llm_report["failed_segments"] += int(
+                    llm_result.get("failed_segments", 0)
+                )
+                if str(llm_result.get("status")).strip().lower() == "ok":
+                    segment_vectors = llm_result.get("segment_vectors", {})
+                    llm_warnings = (
+                        llm_result.get("warnings", [])
+                        if isinstance(llm_result.get("warnings"), list)
+                        else []
+                    )
+                    if isinstance(segment_vectors, dict) and segment_vectors:
+                        for segment in segment_context:
+                            if not isinstance(segment, dict):
+                                continue
+                            segment_index = segment.get("segment_index")
+                            if (
+                                isinstance(segment_index, int)
+                                and segment_index in segment_vectors
+                            ):
+                                segment["municipality_names"] = segment_vectors[segment_index]
+
+                        rebuilt_route_vector: List[str] = []
+                        for segment in segment_context:
+                            if not isinstance(segment, dict):
+                                continue
+                            for municipality_name in _normalize_municipality_vector(
+                                segment.get("municipality_names")
+                            ):
+                                _append_unique_in_order(
+                                    rebuilt_route_vector, municipality_name
+                                )
+                        if rebuilt_route_vector:
+                            route_municipality_vector = rebuilt_route_vector
+                    elif llm_result.get("route_municipality_vector"):
+                        route_municipality_vector = _normalize_municipality_vector(
+                            llm_result.get("route_municipality_vector")
+                        )
+
+                    municipality_llm_report["enriched_routes"] += 1
+                    added_rows = (
+                        llm_result.get("added_municipalities", [])
+                        if isinstance(llm_result.get("added_municipalities"), list)
+                        else []
+                    )
+                    added_rows = added_rows[:20]
+                    if added_rows:
+                        municipality_llm_added_report.append(
+                            {
+                                "vehicle": route.get("vehicle"),
+                                "added_municipalities": added_rows,
+                            }
+                        )
+                    route_llm_summary = {
+                        "status": "ok",
+                        "reason": "enriched",
+                        "added_municipalities": added_rows,
+                    }
+                    if llm_warnings:
+                        route_llm_summary["warnings"] = llm_warnings[:20]
+                        if len(municipality_llm_report["errors"]) < 40:
+                            for warning_text in llm_warnings:
+                                if len(municipality_llm_report["errors"]) >= 40:
+                                    break
+                                municipality_llm_report["errors"].append(
+                                    f"vehicle={route.get('vehicle')}: {warning_text}"
+                                )
+                else:
+                    error_text = str(llm_result.get("error") or "Unknown LLM error").strip()
+                    municipality_llm_report["failed_routes"] += 1
+                    municipality_llm_errors.append(
+                        f"vehicle={route.get('vehicle')}: {error_text}"
+                    )
+                    if len(municipality_llm_report["errors"]) < 40:
+                        municipality_llm_report["errors"].append(
+                            f"vehicle={route.get('vehicle')}: {error_text}"
+                        )
+                    route_llm_summary = {
+                        "status": "failed",
+                        "reason": error_text,
+                        "added_municipalities": [],
+                    }
+                    if debug_first_route:
+                        _safe_console_print(
+                            f"[municipality-llm][route-1][failure] {error_text}"
+                        )
+        elif municipality_llm_enrichment_enabled:
+            route_llm_summary = {
+                "status": "skipped",
+                "reason": "llm_not_configured",
+                "added_municipalities": [],
+            }
+            municipality_llm_report["skipped_routes"] += 1
+            if len(municipality_llm_report["skipped_reasons"]) < 40:
+                municipality_llm_report["skipped_reasons"].append(
+                    {
+                        "vehicle": route.get("vehicle"),
+                        "reason": "llm_not_configured",
+                    }
+                )
+            if route_index == 0:
+                _safe_console_print("[municipality-llm][route-1][skip] llm_not_configured")
+
         segment_records += len(segment_context)
         matched_locations += len(semantic_locations)
         routes_output.append(
@@ -2353,16 +3750,59 @@ def build_semantic_layer(
                 "province_vector": route_province_vector,
                 "province_capital_vector": route_province_capital_vector,
                 "municipality_vector": route_municipality_vector,
+                "road_vector": route_road_vector,
+                "municipality_llm": route_llm_summary,
                 "semantic_locations": semantic_locations,
                 "segment_context": segment_context,
             }
         )
+
+    if municipality_llm_enrichment_enabled:
+        municipality_llm_report["added_municipalities_by_route"] = municipality_llm_added_report[
+            :20
+        ]
+        if not municipality_llm_configured:
+            municipality_llm_report["status"] = "misconfigured"
+            municipality_llm_report["message"] = (
+                "Municipality LLM enrichment was requested but Azure OpenAI endpoint/api_key/deployment is missing."
+            )
+        else:
+            attempted_routes = int(municipality_llm_report.get("attempted_routes", 0))
+            enriched_routes = int(municipality_llm_report.get("enriched_routes", 0))
+            failed_routes = int(municipality_llm_report.get("failed_routes", 0))
+            skipped_routes = int(municipality_llm_report.get("skipped_routes", 0))
+            if attempted_routes == 0 and skipped_routes > 0:
+                municipality_llm_report["status"] = "skipped"
+                municipality_llm_report["message"] = (
+                    "Municipality LLM enrichment skipped for all routes due to guard conditions."
+                )
+            elif failed_routes == 0 and enriched_routes > 0:
+                municipality_llm_report["status"] = "ok"
+                municipality_llm_report["message"] = (
+                    "Municipality LLM enrichment completed successfully."
+                )
+            elif failed_routes > 0 and enriched_routes > 0:
+                municipality_llm_report["status"] = "partial"
+                municipality_llm_report["message"] = (
+                    "Municipality LLM enrichment completed with partial failures."
+                )
+            elif failed_routes > 0:
+                municipality_llm_report["status"] = "failed"
+                municipality_llm_report["message"] = (
+                    "Municipality LLM enrichment failed for all attempted routes."
+                )
+            else:
+                municipality_llm_report["status"] = "empty"
+                municipality_llm_report["message"] = (
+                    "Municipality LLM enrichment had no applicable routes."
+                )
 
     municipality_address_book = municipality_lookup["book"]
     municipality_post_output_notice = (
         "Municipality fallback warning: municipality enrichment disabled."
     )
     municipality_post_output_warnings: List[str] = []
+    municipality_post_output_infos: List[str] = []
     if municipality_enrichment_enabled:
         phase2_snapshot_after = _lookup_snapshot(municipality_lookup)
         phase2_counts = _summarize_points(municipality_phase2_points, municipality_lookup["book"])
@@ -2478,8 +3918,11 @@ def build_semantic_layer(
                 "total": len(province_capital_cache),
                 "errors": province_capital_errors[:20],
             },
+            "llm": municipality_llm_report,
             "route_geometry": dict(segment_shape_stats),
-            "errors": (municipality_errors + province_capital_errors)[:40],
+            "errors": (
+                municipality_errors + municipality_llm_errors + province_capital_errors
+            )[:40],
         }
         fallback_to_straight = int(
             municipality_api.get("route_geometry", {}).get("fallback_to_straight", 0)
@@ -2502,8 +3945,49 @@ def build_semantic_layer(
                 "WARNING: Municipality API status is "
                 f"'{municipality_api.get('status')}'. Review municipality_api.phase1/phase2."
             )
-        if municipality_post_output_warnings:
-            municipality_post_output_notice = " | ".join(municipality_post_output_warnings)
+        llm_status = str(
+            municipality_api.get("llm", {}).get("status")
+            if isinstance(municipality_api.get("llm"), dict)
+            else ""
+        ).strip().lower()
+        if municipality_llm_enrichment_enabled and llm_status not in {"ok", "empty", "skipped"}:
+            municipality_post_output_warnings.append(
+                "WARNING: Municipality LLM status is "
+                f"'{municipality_api.get('llm', {}).get('status')}'. Review municipality_api.llm."
+            )
+        llm_added_by_route = (
+            municipality_api.get("llm", {}).get("added_municipalities_by_route", [])
+            if isinstance(municipality_api.get("llm"), dict)
+            else []
+        )
+        if isinstance(llm_added_by_route, list) and llm_added_by_route:
+            route_chunks: List[str] = []
+            for row in llm_added_by_route[:8]:
+                if not isinstance(row, dict):
+                    continue
+                vehicle = row.get("vehicle")
+                additions = (
+                    row.get("added_municipalities", [])
+                    if isinstance(row.get("added_municipalities"), list)
+                    else []
+                )
+                names = [
+                    _normalize_llm_text(item.get("name"))
+                    for item in additions
+                    if isinstance(item, dict)
+                ]
+                names = [name for name in names if name]
+                if not names:
+                    continue
+                route_chunks.append(f"V{vehicle}: " + ", ".join(names[:10]))
+            if route_chunks:
+                municipality_post_output_infos.append(
+                    "INFO: LLM-added municipalities -> " + " | ".join(route_chunks)
+                )
+        if municipality_post_output_warnings or municipality_post_output_infos:
+            municipality_post_output_notice = " | ".join(
+                municipality_post_output_warnings + municipality_post_output_infos
+            )
         else:
             municipality_post_output_notice = (
                 "Municipality fallback warning: none. Municipality tracing completed without fallback."
@@ -2515,6 +3999,7 @@ def build_semantic_layer(
         "config": {
             "semantic_corridor_radius_km": round(radius_km, 3),
             "semantic_top_k": top_k,
+            "semantic_stop_exclusion_km": round(stop_exclusion_km, 3),
             "route_avg_speed_kmh": round(avg_speed_kmh, 3),
             "semantic_categories": sorted(semantic_categories),
             "departure_time_utc": _to_iso_z(departure_time_utc),
@@ -2540,6 +4025,13 @@ def build_semantic_layer(
             ),
             "municipality_reverse_source": "nominatim_reverse",
             "municipality_enrichment_enabled": municipality_enrichment_enabled,
+            "municipality_llm_enrichment_enabled": municipality_llm_enrichment_enabled,
+            "municipality_llm_configured": municipality_llm_configured,
+            "municipality_llm_timeout_sec": municipality_llm_timeout_sec,
+            "municipality_llm_retries": municipality_llm_retries,
+            "municipality_llm_max_tokens": municipality_llm_max_tokens,
+            "municipality_llm_temperature": MUNICIPALITY_LLM_TEMPERATURE,
+            "municipality_llm_api_version": azure_openai_api_version,
             "municipality_osm_enabled": False,
             "municipality_use_route_geometry": municipality_use_route_geometry,
             "municipality_route_geometry_enabled": municipality_route_geometry_enabled,
@@ -2595,6 +4087,81 @@ def build_semantic_layer(
                 if isinstance(municipality_api.get("route_geometry"), dict)
                 else 0
             ),
+            "municipality_route_geometry_skipped_identical_endpoints": (
+                municipality_api.get("route_geometry", {}).get("skipped_identical_endpoints")
+                if isinstance(municipality_api.get("route_geometry"), dict)
+                else 0
+            ),
+            "municipality_llm_status": (
+                municipality_api.get("llm", {}).get("status")
+                if isinstance(municipality_api.get("llm"), dict)
+                else "disabled"
+            ),
+            "municipality_llm_attempted_routes": (
+                municipality_api.get("llm", {}).get("attempted_routes")
+                if isinstance(municipality_api.get("llm"), dict)
+                else 0
+            ),
+            "municipality_llm_enriched_routes": (
+                municipality_api.get("llm", {}).get("enriched_routes")
+                if isinstance(municipality_api.get("llm"), dict)
+                else 0
+            ),
+            "municipality_llm_skipped_routes": (
+                municipality_api.get("llm", {}).get("skipped_routes")
+                if isinstance(municipality_api.get("llm"), dict)
+                else 0
+            ),
+            "municipality_llm_failed_routes": (
+                municipality_api.get("llm", {}).get("failed_routes")
+                if isinstance(municipality_api.get("llm"), dict)
+                else 0
+            ),
+            "municipality_llm_attempted_segments": (
+                municipality_api.get("llm", {}).get("attempted_segments")
+                if isinstance(municipality_api.get("llm"), dict)
+                else 0
+            ),
+            "municipality_llm_enriched_segments": (
+                municipality_api.get("llm", {}).get("enriched_segments")
+                if isinstance(municipality_api.get("llm"), dict)
+                else 0
+            ),
+            "municipality_llm_failed_segments": (
+                municipality_api.get("llm", {}).get("failed_segments")
+                if isinstance(municipality_api.get("llm"), dict)
+                else 0
+            ),
+            "municipality_llm_added_routes": (
+                len(
+                    municipality_api.get("llm", {}).get("added_municipalities_by_route", [])
+                )
+                if isinstance(municipality_api.get("llm"), dict)
+                and isinstance(
+                    municipality_api.get("llm", {}).get("added_municipalities_by_route"),
+                    list,
+                )
+                else 0
+            ),
+            "municipality_llm_added_municipalities": (
+                sum(
+                    len(
+                        row.get("added_municipalities", [])
+                        if isinstance(row, dict)
+                        and isinstance(row.get("added_municipalities"), list)
+                        else []
+                    )
+                    for row in municipality_api.get("llm", {}).get(
+                        "added_municipalities_by_route", []
+                    )
+                )
+                if isinstance(municipality_api.get("llm"), dict)
+                and isinstance(
+                    municipality_api.get("llm", {}).get("added_municipalities_by_route"),
+                    list,
+                )
+                else 0
+            ),
             "municipality_address_records": len(municipality_address_book),
             "municipality_phase1_input_points": len(municipality_phase1_input_points),
             "province_capital_records": len(province_capital_cache),
@@ -2606,11 +4173,15 @@ def build_semantic_layer(
             "municipality_post_output_notice": municipality_post_output_notice,
             "here_client_stats": here_client.stats() if here_client is not None else {},
         },
-        "errors": (here_errors + municipality_errors + province_capital_errors)[:40],
+        "errors": (
+            here_errors + municipality_errors + municipality_llm_errors + province_capital_errors
+        )[:40],
         "municipality_api": municipality_api,
         "municipality_address_book": municipality_address_book,
         "municipality_phase1_input_points": municipality_phase1_input_points,
         "municipality_post_output_notice": municipality_post_output_notice,
         "municipality_post_output_warnings": municipality_post_output_warnings,
+        "municipality_post_output_infos": municipality_post_output_infos,
         "routes": routes_output,
     }
+
