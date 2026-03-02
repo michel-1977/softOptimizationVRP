@@ -107,6 +107,24 @@ def _resolve_here_data_source(value) -> str:
     return "here"
 
 
+def _new_checkpoint_logger(flow_name: str):
+    started_at = time.perf_counter()
+    last_mark = started_at
+
+    def checkpoint(step_name: str) -> None:
+        nonlocal last_mark
+        now = time.perf_counter()
+        phase_elapsed_sec = now - last_mark
+        total_elapsed_sec = now - started_at
+        print(
+            f"[checkpoint:{flow_name}] {step_name} | "
+            f"phase={phase_elapsed_sec:.3f}s total={total_elapsed_sec:.3f}s"
+        )
+        last_mark = now
+
+    return checkpoint
+
+
 def _prefetch_here_point_observations(payload: dict, depot: dict, customers: list) -> dict:
     updated_payload = dict(payload)
     here_data_source = _resolve_here_data_source(payload.get("here_data_source"))
@@ -1515,6 +1533,14 @@ HTML_PAGE = """
         <div class="small">Disable this to validate municipality trace without Azure OpenAI calls.</div>
       </div>
 
+      <div class="row">
+        <label>Municipality reverse geocoder</label>
+        <select id="municipalityReverseSource">
+          <option value="azure_maps_reverse" selected>Azure Maps (default)</option>
+          <option value="nominatim_reverse">Nominatim (OSM)</option>
+        </select>
+      </div>
+
       <div class="row" style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
         <div>
           <label>LLM timeout (sec)</label>
@@ -1773,6 +1799,13 @@ HTML_PAGE = """
           municipality_llm_retries: Number.isFinite(retriesRaw) ? Math.max(0, retriesRaw) : 1,
           municipality_llm_max_tokens: Number.isFinite(maxTokensRaw) ? Math.max(200, maxTokensRaw) : 4000
         };
+      }
+
+      function readMunicipalityReverseSource() {
+        const value = String(
+          document.getElementById('municipalityReverseSource')?.value || 'azure_maps_reverse'
+        ).trim().toLowerCase();
+        return value === 'nominatim_reverse' ? 'nominatim_reverse' : 'azure_maps_reverse';
       }
 
       function escapeHtml(value) {
@@ -2532,6 +2565,7 @@ HTML_PAGE = """
         payload.municipality_llm_timeout_sec = llmSettings.municipality_llm_timeout_sec;
         payload.municipality_llm_retries = llmSettings.municipality_llm_retries;
         payload.municipality_llm_max_tokens = llmSettings.municipality_llm_max_tokens;
+        payload.municipality_reverse_source = readMunicipalityReverseSource();
 
         payload.here_forecast_window_hours = 24;
         payload.here_forecast_interval_min = Math.max(30, parseInt(document.getElementById('hereForecastInterval').value || '120', 10));
@@ -2581,6 +2615,7 @@ HTML_PAGE = """
         payload.municipality_llm_timeout_sec = llmSettings.municipality_llm_timeout_sec;
         payload.municipality_llm_retries = llmSettings.municipality_llm_retries;
         payload.municipality_llm_max_tokens = llmSettings.municipality_llm_max_tokens;
+        payload.municipality_reverse_source = readMunicipalityReverseSource();
         setMunicipalityButtonState(true, true);
         document.getElementById('output').textContent = payload.municipality_llm_enrichment_enabled
           ? 'Computing municipality trace with OSM + LLM...'
@@ -2612,6 +2647,7 @@ HTML_PAGE = """
 
 
 def _solve(req: func.HttpRequest) -> func.HttpResponse:
+    checkpoint = _new_checkpoint_logger("solve_vrp")
     try:
         payload = req.get_json()
     except ValueError:
@@ -2620,6 +2656,7 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=400,
         )
+    checkpoint("request parsed")
 
     depot = payload.get("depot")
     customers = payload.get("customers", [])
@@ -2649,6 +2686,7 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
         semantic_payload = _prefetch_here_point_observations(
             semantic_payload, depot, customers
         )
+    checkpoint("here prefetch completed")
 
     try:
         result = solve_vrp_nearest_neighbor(
@@ -2671,6 +2709,7 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=500,
         )
+    checkpoint("vrp solver completed")
 
     if _as_bool(semantic_payload.get("poi_auto_enabled"), False):
         result["poi_auto_fetch"] = {
@@ -2698,10 +2737,12 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
             result["semantic_layer_error"] = (
                 "Semantic enrichment failed; VRP result remains valid."
             )
+    checkpoint("semantic layer completed")
 
     if "_here_prefetch" in semantic_payload:
         result["here_prefetch"] = semantic_payload["_here_prefetch"]
 
+    checkpoint("response ready")
     return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
 
 
@@ -2872,6 +2913,7 @@ def _merge_municipality_semantic(
 
 
 def _enrich_municipality(req: func.HttpRequest) -> func.HttpResponse:
+    checkpoint = _new_checkpoint_logger("enrich_municipality")
     try:
         body = req.get_json()
     except ValueError:
@@ -2880,6 +2922,7 @@ def _enrich_municipality(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=400,
         )
+    checkpoint("request parsed")
 
     if not isinstance(body, dict):
         return func.HttpResponse(
@@ -2919,6 +2962,7 @@ def _enrich_municipality(req: func.HttpRequest) -> func.HttpResponse:
     semantic_payload, poi_auto_meta = _auto_populate_candidate_locations(
         semantic_payload, vrp_result
     )
+    checkpoint("poi auto-population completed")
     result["poi_auto_fetch"] = poi_auto_meta
     if isinstance(semantic_payload.get("candidate_locations"), list):
         result["candidate_locations"] = semantic_payload["candidate_locations"]
@@ -2935,6 +2979,7 @@ def _enrich_municipality(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             json.dumps(result), mimetype="application/json", status_code=200
         )
+    checkpoint("municipality semantic layer completed")
 
     if isinstance(existing_semantic, dict):
         result["semantic_layer"] = _merge_municipality_semantic(
@@ -2943,6 +2988,7 @@ def _enrich_municipality(req: func.HttpRequest) -> func.HttpResponse:
     else:
         result["semantic_layer"] = municipality_semantic
 
+    checkpoint("response ready")
     return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
 
 

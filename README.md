@@ -52,9 +52,16 @@ Both solve endpoints are available:
 - `POST http://localhost:7071/solve_vrp`
 - `POST http://localhost:7071/api/solve_vrp`
 
-## Semantic Layer (v0.5)
+## Semantic Layer (v0.5.1)
 
 Every solve response now includes `semantic_layer` by default (disable with `include_semantic_layer=false`).
+
+Release notes vs previous version:
+
+- Added dual municipality reverse-geocoding providers (`nominatim_reverse` and `azure_maps_reverse`).
+- Kept backend default as `nominatim_reverse` for compatibility, and added UI-level selector with Azure Maps preselected.
+- Added terminal checkpoints in solve and municipality enrichment flows to show per-phase time spent in seconds.
+- Bumped semantic layer release field to `0.9.1`.
 
 Optional request fields for enrichment:
 
@@ -76,9 +83,15 @@ Optional request fields for enrichment:
 - `here_traffic_radius_m`: real-time traffic query radius around each segment midpoint
 - `here_forecast_window_hours`: forecast window size (default 24)
 - `here_forecast_interval_min`: sampling interval for forecast slots (default 120)
+- `municipality_reverse_source`: reverse geocoder provider, `nominatim_reverse` (default) or `azure_maps_reverse`
+- `municipality_reverse_min_interval_ms`: throttle between reverse-geocode requests (default `1100` for Nominatim, `100` for Azure Maps)
 - `municipality_llm_enrichment_enabled`: enable Azure OpenAI municipality completion over route + segments (default `true` when municipality enrichment is enabled)
 - `municipality_llm_timeout_sec`: timeout for Azure OpenAI calls (default `60`)
 - `municipality_llm_retries`: number of LLM retries per route (default `2`)
+- `municipality_llm_max_tokens`: max token budget for municipality LLM calls (default `4000`)
+- `azure_maps_subscription_key`: optional payload override for reverse geocoding key (normally read from env var)
+- `azure_maps_reverse_endpoint`: optional endpoint override (default `https://atlas.microsoft.com/reverseGeocode`)
+- `azure_maps_reverse_api_version`: optional API version override (default `2025-01-01`)
 - `azure_openai_endpoint`, `azure_openai_api_key`, `azure_openai_deployment`, `azure_openai_api_version`: optional payload overrides (normally read from environment variables)
 
 The response `semantic_layer` contains:
@@ -99,12 +112,16 @@ Without HERE key in live mode, the system falls back to user-provided `weather_o
 
 ### Local key setup
 
-For local Azure Functions runs, copy `local.settings.example.json` to `local.settings.json` and set your HERE key:
+For local Azure Functions runs, copy `local.settings.example.json` to `local.settings.json` and set your HERE key plus reverse geocoder settings:
 
 ```json
 {
   "Values": {
     "HERE_API_KEY": "YOUR_HERE_KEY",
+    "MUNICIPALITY_REVERSE_SOURCE": "nominatim_reverse",
+    "AZURE_MAPS_SUBSCRIPTION_KEY": "YOUR_AZURE_MAPS_KEY",
+    "AZURE_MAPS_REVERSE_ENDPOINT": "https://atlas.microsoft.com/reverseGeocode",
+    "AZURE_MAPS_REVERSE_API_VERSION": "2025-01-01",
     "AZURE_OPENAI_ENDPOINT": "https://YOUR_RESOURCE_NAME.openai.azure.com/",
     "AZURE_OPENAI_API_KEY": "YOUR_AZURE_OPENAI_KEY",
     "AZURE_OPENAI_DEPLOYMENT": "YOUR_DEPLOYMENT_NAME",
@@ -112,6 +129,8 @@ For local Azure Functions runs, copy `local.settings.example.json` to `local.set
   }
 }
 ```
+
+Reverse geocoding supports both providers. Default is Nominatim (`nominatim_reverse`); switch to Azure Maps by setting `MUNICIPALITY_REVERSE_SOURCE=azure_maps_reverse` (and configuring `AZURE_MAPS_SUBSCRIPTION_KEY`).
 
 ### Pipeline modes
 

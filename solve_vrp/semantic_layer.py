@@ -28,7 +28,11 @@ DEFAULT_OSM_TIMEOUT_SEC = 8
 DEFAULT_OSRM_ROUTE_TIMEOUT_SEC = 10
 DEFAULT_MUNICIPALITY_MAX_SAMPLES_PER_SEGMENT = 6 # was 12
 DEFAULT_MUNICIPALITY_REVERSE_MIN_INTERVAL_MS = 1100
+DEFAULT_AZURE_MAPS_REVERSE_MIN_INTERVAL_MS = 100
+DEFAULT_MUNICIPALITY_REVERSE_SOURCE = "nominatim_reverse"
 DEFAULT_AZURE_OPENAI_API_VERSION = "2024-10-21"
+DEFAULT_AZURE_MAPS_REVERSE_API_VERSION = "2025-01-01"
+DEFAULT_AZURE_MAPS_REVERSE_ENDPOINT = "https://atlas.microsoft.com/reverseGeocode"
 DEFAULT_MUNICIPALITY_LLM_TIMEOUT_SEC = 90
 DEFAULT_MUNICIPALITY_LLM_RETRIES = 2
 DEFAULT_MUNICIPALITY_LLM_MAX_TOKENS = 4000
@@ -168,6 +172,15 @@ def _resolve_here_data_source(value: Any) -> str:
     if raw in {"emulator", "mock", "simulated", "synthetic"}:
         return "emulator"
     return "here"
+
+
+def _resolve_municipality_reverse_source(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"azure", "azure_maps", "azure_maps_reverse", "azmaps"}:
+        return "azure_maps_reverse"
+    if raw in {"nominatim", "nominatim_reverse", "osm"}:
+        return "nominatim_reverse"
+    return DEFAULT_MUNICIPALITY_REVERSE_SOURCE
 
 
 def _to_iso_z(dt: Optional[datetime]) -> Optional[str]:
@@ -1515,11 +1528,12 @@ def _empty_municipality_entry(
     *,
     error: Optional[str] = None,
     source_endpoint: Optional[str] = None,
+    source: str = "nominatim_reverse",
 ) -> Dict[str, Any]:
     status = "error" if error else "unknown"
     return {
         "status": status,
-        "source": "nominatim_reverse",
+        "source": source,
         "source_endpoint": source_endpoint,
         "lat": round(float(lat), 6),
         "lng": round(float(lng), 6),
@@ -1541,64 +1555,224 @@ def _empty_municipality_entry(
     }
 
 
+def _normalize_azure_maps_reverse_address(address: Any) -> Dict[str, Any]:
+    if not isinstance(address, dict):
+        return {}
+
+    normalized: Dict[str, Any] = {}
+
+    def put(key: str, value: Any) -> None:
+        text = str(value or "").strip()
+        if text and key not in normalized:
+            normalized[key] = text
+
+    put("municipality", address.get("municipality"))
+    put("city", address.get("locality"))
+    put("town", address.get("municipalitySubdivision"))
+    put("village", address.get("localName"))
+    put("suburb", address.get("neighborhood"))
+    put("county", address.get("countrySecondarySubdivision"))
+    put("state", address.get("countrySubdivision"))
+    put("province", address.get("countrySubdivisionName") or address.get("countrySubdivision"))
+    put("country", address.get("country"))
+
+    admin_districts = address.get("adminDistricts")
+    if isinstance(admin_districts, list):
+        district_names: List[str] = []
+        for row in admin_districts:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or row.get("shortName") or "").strip()
+            if name:
+                district_names.append(name)
+        if district_names:
+            put("state", district_names[0])
+            put("province", district_names[0])
+            if len(district_names) >= 2:
+                put("county", district_names[1])
+
+    country_region = address.get("countryRegion")
+    if isinstance(country_region, dict):
+        put("country", country_region.get("name"))
+        iso_value = str(
+            country_region.get("iso")
+            or country_region.get("ISO")
+            or country_region.get("code")
+            or ""
+        ).strip()
+        if len(iso_value) == 2:
+            normalized["country_code"] = iso_value.lower()
+
+    for candidate in (
+        address.get("countryCode"),
+        address.get("countryCodeISO2"),
+        address.get("countryIsoCode"),
+    ):
+        value = str(candidate or "").strip()
+        if len(value) == 2:
+            normalized["country_code"] = value.lower()
+            break
+
+    return normalized
+
+
 def _reverse_geocode_stop_address(
     lat: float,
     lng: float,
     timeout_sec: int,
+    reverse_source: str,
+    azure_maps_subscription_key: str,
+    azure_maps_reverse_endpoint: str,
+    azure_maps_api_version: str,
 ) -> Dict[str, Any]:
+    selected_source = _resolve_municipality_reverse_source(reverse_source)
+
+    if selected_source == "nominatim_reverse":
+        params = urllib.parse.urlencode(
+            {
+                "format": "jsonv2",
+                "lat": round(float(lat), 6),
+                "lon": round(float(lng), 6),
+                "addressdetails": 1,
+                "zoom": 10,
+                "namedetails": 1,
+            }
+        )
+        payload = None
+        source_endpoint = None
+        last_error: Optional[str] = None
+        for endpoint in DEFAULT_REVERSE_GEOCODER_ENDPOINTS:
+            url = f"{endpoint}?{params}"
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "softOptimizationVRP/municipality-reverse-geocoder",
+                        "Accept": "application/json",
+                    },
+                    method="GET",
+                )
+                with urllib.request.urlopen(request, timeout=max(2, timeout_sec)) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    source_endpoint = endpoint
+                    break
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{endpoint}: {exc}"
+                time.sleep(0.15)
+
+        if payload is None:
+            raise RuntimeError(last_error or "No reverse geocoder endpoint available.")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected reverse geocoder payload.")
+
+        error_msg = str(payload.get("error") or "").strip()
+        if error_msg:
+            raise RuntimeError(f"{source_endpoint or 'reverse_geocoder'}: {error_msg}")
+
+        municipality_name, municipality_source_field = _extract_municipality_from_reverse_payload(
+            payload
+        )
+        address = payload.get("address", {})
+        if not isinstance(address, dict):
+            address = {}
+        osm_type = str(payload.get("osm_type") or "").strip() or None
+        osm_id = payload.get("osm_id")
+        osm_ref = None
+        if osm_type is not None and osm_id is not None:
+            osm_ref = f"{osm_type}/{osm_id}"
+
+        if municipality_name is None:
+            lower_keys = {str(key).strip().lower() for key in address.keys()}
+            if lower_keys and lower_keys.issubset(NON_MUNICIPALITY_ADMIN_FIELDS):
+                resolution_note = "non_municipality_admin_only"
+            else:
+                resolution_note = "municipality_not_found"
+        else:
+            resolution_note = "resolved"
+
+        return {
+            "status": "resolved" if municipality_name else "unknown",
+            "source": "nominatim_reverse",
+            "source_endpoint": source_endpoint,
+            "lat": round(float(lat), 6),
+            "lng": round(float(lng), 6),
+            "municipality_name": municipality_name,
+            "municipality_source_field": municipality_source_field,
+            "display_name": payload.get("display_name"),
+            "address": address,
+            "osm_type": osm_type,
+            "osm_id": osm_id,
+            "osm_ref": osm_ref,
+            "place_id": payload.get("place_id"),
+            "category": payload.get("category"),
+            "type": payload.get("type"),
+            "resolution_note": resolution_note,
+            "stop_ids": [],
+            "customer_ids": [],
+            "source_tags": [],
+        }
+
+    subscription_key = str(azure_maps_subscription_key or "").strip()
+    if not subscription_key:
+        raise RuntimeError("AZURE_MAPS_SUBSCRIPTION_KEY is not configured.")
+
+    endpoint = (
+        str(azure_maps_reverse_endpoint or "").strip().rstrip("/")
+        or DEFAULT_AZURE_MAPS_REVERSE_ENDPOINT
+    )
+    api_version = (
+        str(azure_maps_api_version or "").strip() or DEFAULT_AZURE_MAPS_REVERSE_API_VERSION
+    )
+
     params = urllib.parse.urlencode(
         {
-            "format": "jsonv2",
-            "lat": round(float(lat), 6),
-            "lon": round(float(lng), 6),
-            "addressdetails": 1,
-            "zoom": 10,
-            "namedetails": 1,
+            "api-version": api_version,
+            "subscription-key": subscription_key,
+            "coordinates": f"{round(float(lng), 6)},{round(float(lat), 6)}",
+            "resultTypes": "Address",
+            "view": "Auto",
         }
     )
-    payload = None
-    source_endpoint = None
-    last_error: Optional[str] = None
-    for endpoint in DEFAULT_REVERSE_GEOCODER_ENDPOINTS:
-        url = f"{endpoint}?{params}"
-        try:
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "softOptimizationVRP/municipality-reverse-geocoder",
-                    "Accept": "application/json",
-                },
-                method="GET",
-            )
-            with urllib.request.urlopen(request, timeout=max(2, timeout_sec)) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                source_endpoint = endpoint
-                break
-        except Exception as exc:  # noqa: BLE001
-            last_error = f"{endpoint}: {exc}"
-            time.sleep(0.15)
+    url = f"{endpoint}?{params}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "softOptimizationVRP/municipality-reverse-geocoder",
+            "Accept": "application/geo+json, application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(2, timeout_sec)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"{endpoint}: {exc}") from exc
 
-    if payload is None:
-        raise RuntimeError(last_error or "No reverse geocoder endpoint available.")
     if not isinstance(payload, dict):
-        raise RuntimeError("Unexpected reverse geocoder payload.")
+        raise RuntimeError("Unexpected Azure Maps reverse geocoder payload.")
 
-    error_msg = str(payload.get("error") or "").strip()
-    if error_msg:
-        raise RuntimeError(f"{source_endpoint or 'reverse_geocoder'}: {error_msg}")
+    error_payload = payload.get("error")
+    if isinstance(error_payload, dict):
+        code = str(error_payload.get("code") or "").strip()
+        message = str(error_payload.get("message") or "").strip()
+        reason = f"{code}: {message}" if code and message else (message or code)
+        raise RuntimeError(f"{endpoint}: {reason or 'Azure Maps reverse geocoder error.'}")
 
-    municipality_name, municipality_source_field = _extract_municipality_from_reverse_payload(payload)
-    address = payload.get("address", {})
-    if not isinstance(address, dict):
-        address = {}
-    osm_type = str(payload.get("osm_type") or "").strip() or None
-    osm_id = payload.get("osm_id")
-    osm_ref = None
-    if osm_type is not None and osm_id is not None:
-        osm_ref = f"{osm_type}/{osm_id}"
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        raise RuntimeError("Azure Maps reverse geocoder payload does not contain features.")
+    first_feature = features[0] if isinstance(features[0], dict) else {}
+    properties = first_feature.get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    raw_address = properties.get("address", {})
+    normalized_address = _normalize_azure_maps_reverse_address(raw_address)
+    municipality_name, municipality_source_field = _extract_municipality_from_reverse_payload(
+        {"address": normalized_address}
+    )
 
     if municipality_name is None:
-        lower_keys = {str(key).strip().lower() for key in address.keys()}
+        lower_keys = {str(key).strip().lower() for key in normalized_address.keys()}
         if lower_keys and lower_keys.issubset(NON_MUNICIPALITY_ADMIN_FIELDS):
             resolution_note = "non_municipality_admin_only"
         else:
@@ -1606,22 +1780,28 @@ def _reverse_geocode_stop_address(
     else:
         resolution_note = "resolved"
 
+    formatted_address = (
+        properties.get("formattedAddress")
+        if isinstance(properties.get("formattedAddress"), str)
+        else None
+    )
+
     return {
         "status": "resolved" if municipality_name else "unknown",
-        "source": "nominatim_reverse",
-        "source_endpoint": source_endpoint,
+        "source": "azure_maps_reverse",
+        "source_endpoint": endpoint,
         "lat": round(float(lat), 6),
         "lng": round(float(lng), 6),
         "municipality_name": municipality_name,
         "municipality_source_field": municipality_source_field,
-        "display_name": payload.get("display_name"),
-        "address": address,
-        "osm_type": osm_type,
-        "osm_id": osm_id,
-        "osm_ref": osm_ref,
-        "place_id": payload.get("place_id"),
-        "category": payload.get("category"),
-        "type": payload.get("type"),
+        "display_name": formatted_address,
+        "address": normalized_address,
+        "osm_type": None,
+        "osm_id": None,
+        "osm_ref": None,
+        "place_id": first_feature.get("id"),
+        "category": properties.get("type"),
+        "type": first_feature.get("type"),
         "resolution_note": resolution_note,
         "stop_ids": [],
         "customer_ids": [],
@@ -1633,11 +1813,25 @@ def _build_municipality_lookup(
     initial_book: Optional[Dict[str, Dict[str, Any]]],
     timeout_sec: int,
     min_interval_ms: int,
+    reverse_source: str,
+    azure_maps_subscription_key: str,
+    azure_maps_reverse_endpoint: str,
+    azure_maps_api_version: str,
 ) -> Dict[str, Any]:
     return {
         "book": dict(initial_book) if isinstance(initial_book, dict) else {},
         "timeout_sec": max(2, int(timeout_sec)),
         "min_interval_ms": max(0, int(min_interval_ms)),
+        "reverse_source": _resolve_municipality_reverse_source(reverse_source),
+        "azure_maps_subscription_key": str(azure_maps_subscription_key or "").strip(),
+        "azure_maps_reverse_endpoint": (
+            str(azure_maps_reverse_endpoint or "").strip()
+            or DEFAULT_AZURE_MAPS_REVERSE_ENDPOINT
+        ),
+        "azure_maps_api_version": (
+            str(azure_maps_api_version or "").strip()
+            or DEFAULT_AZURE_MAPS_REVERSE_API_VERSION
+        ),
         "last_request_ts": None,
         "http_requests": 0,
         "cache_hits": 0,
@@ -1684,17 +1878,37 @@ def _resolve_municipality_point(
             time.sleep((min_interval_ms - elapsed_ms) / 1000.0)
 
     try:
+        reverse_source = _resolve_municipality_reverse_source(
+            lookup.get("reverse_source")
+        )
         row = _reverse_geocode_stop_address(
             lat=lat,
             lng=lng,
             timeout_sec=int(lookup.get("timeout_sec", DEFAULT_OSM_TIMEOUT_SEC)),
+            reverse_source=reverse_source,
+            azure_maps_subscription_key=str(
+                lookup.get("azure_maps_subscription_key") or ""
+            ),
+            azure_maps_reverse_endpoint=str(
+                lookup.get("azure_maps_reverse_endpoint")
+                or DEFAULT_AZURE_MAPS_REVERSE_ENDPOINT
+            ),
+            azure_maps_api_version=str(
+                lookup.get("azure_maps_api_version")
+                or DEFAULT_AZURE_MAPS_REVERSE_API_VERSION
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         lookup["http_requests"] = int(lookup.get("http_requests", 0)) + 1
         lookup["last_request_ts"] = time.monotonic()
         if errors is not None:
             errors.append(f"{context_label} failed at {round(lat, 6)},{round(lng, 6)}: {exc}")
-        row = _empty_municipality_entry(lat, lng, error=str(exc))
+        row = _empty_municipality_entry(
+            lat,
+            lng,
+            error=str(exc),
+            source=reverse_source,
+        )
         _merge_point_metadata(row, point)
         book[key] = row
         return key, row
@@ -3027,6 +3241,28 @@ def build_semantic_layer(
     municipality_timeout_sec = max(
         2, _safe_int(raw_payload.get("municipality_osm_timeout_sec"), DEFAULT_OSM_TIMEOUT_SEC)
     )
+    azure_maps_subscription_key = str(
+        raw_payload.get("azure_maps_subscription_key")
+        or os.getenv("AZURE_MAPS_SUBSCRIPTION_KEY", "")
+    ).strip()
+    azure_maps_reverse_endpoint = str(
+        raw_payload.get("azure_maps_reverse_endpoint")
+        or os.getenv("AZURE_MAPS_REVERSE_ENDPOINT", DEFAULT_AZURE_MAPS_REVERSE_ENDPOINT)
+    ).strip() or DEFAULT_AZURE_MAPS_REVERSE_ENDPOINT
+    azure_maps_reverse_api_version = str(
+        raw_payload.get("azure_maps_reverse_api_version")
+        or os.getenv(
+            "AZURE_MAPS_REVERSE_API_VERSION",
+            DEFAULT_AZURE_MAPS_REVERSE_API_VERSION,
+        )
+    ).strip() or DEFAULT_AZURE_MAPS_REVERSE_API_VERSION
+    municipality_reverse_source = _resolve_municipality_reverse_source(
+        raw_payload.get("municipality_reverse_source")
+        or os.getenv(
+            "MUNICIPALITY_REVERSE_SOURCE",
+            DEFAULT_MUNICIPALITY_REVERSE_SOURCE,
+        )
+    )
     province_capital_lookup_enabled = _safe_bool(
         raw_payload.get("province_capital_lookup_enabled"), True
     )
@@ -3050,11 +3286,19 @@ def build_semantic_layer(
     municipality_enrichment_enabled = _safe_bool(
         raw_payload.get("municipality_enrichment_enabled"), False
     )
+    requested_reverse_min_interval = raw_payload.get("municipality_reverse_min_interval_ms")
+    if requested_reverse_min_interval is None:
+        if municipality_reverse_source == "azure_maps_reverse":
+            default_reverse_min_interval = DEFAULT_AZURE_MAPS_REVERSE_MIN_INTERVAL_MS
+        else:
+            default_reverse_min_interval = DEFAULT_MUNICIPALITY_REVERSE_MIN_INTERVAL_MS
+    else:
+        default_reverse_min_interval = DEFAULT_MUNICIPALITY_REVERSE_MIN_INTERVAL_MS
     municipality_reverse_min_interval_ms = max(
         0,
         _safe_int(
-            raw_payload.get("municipality_reverse_min_interval_ms"),
-            DEFAULT_MUNICIPALITY_REVERSE_MIN_INTERVAL_MS,
+            requested_reverse_min_interval,
+            default_reverse_min_interval,
         ),
     )
     distance_mode = str(raw_payload.get("distance_mode", "direct")).strip().lower()
@@ -3168,6 +3412,10 @@ def build_semantic_layer(
         initial_book={},
         timeout_sec=municipality_timeout_sec,
         min_interval_ms=municipality_reverse_min_interval_ms,
+        reverse_source=municipality_reverse_source,
+        azure_maps_subscription_key=azure_maps_subscription_key,
+        azure_maps_reverse_endpoint=azure_maps_reverse_endpoint,
+        azure_maps_api_version=azure_maps_reverse_api_version,
     )
     segment_shape_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
     segment_shape_stats: Dict[str, Any] = {
@@ -3205,7 +3453,7 @@ def build_semantic_layer(
     phase2_snapshot_before = _lookup_snapshot(municipality_lookup)
     municipality_api: Dict[str, Any] = {
         "enabled": municipality_enrichment_enabled,
-        "source": "nominatim_reverse",
+        "source": municipality_reverse_source,
         "status": "disabled",
         "ok": True,
         "message": "Municipality enrichment disabled.",
@@ -3874,7 +4122,7 @@ def build_semantic_layer(
 
         municipality_api = {
             "enabled": True,
-            "source": "nominatim_reverse",
+            "source": municipality_reverse_source,
             "status": municipality_status,
             "ok": municipality_ok,
             "message": municipality_message,
@@ -3994,7 +4242,7 @@ def build_semantic_layer(
             )
 
     return {
-        "version": "0.9",
+        "version": "0.9.1",
         "generated_at_utc": _to_iso_z(datetime.now(tz=timezone.utc)),
         "config": {
             "semantic_corridor_radius_km": round(radius_km, 3),
@@ -4023,7 +4271,13 @@ def build_semantic_layer(
                 if municipality_route_geometry_enabled
                 else "segment_straight_line_reverse_geocode_samples"
             ),
-            "municipality_reverse_source": "nominatim_reverse",
+            "municipality_reverse_source": municipality_reverse_source,
+            "azure_maps_reverse_enabled": (
+                municipality_reverse_source == "azure_maps_reverse"
+                and bool(azure_maps_subscription_key)
+            ),
+            "azure_maps_reverse_endpoint": azure_maps_reverse_endpoint,
+            "azure_maps_reverse_api_version": azure_maps_reverse_api_version,
             "municipality_enrichment_enabled": municipality_enrichment_enabled,
             "municipality_llm_enrichment_enabled": municipality_llm_enrichment_enabled,
             "municipality_llm_configured": municipality_llm_configured,
