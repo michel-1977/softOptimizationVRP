@@ -1,9 +1,12 @@
 import json
+import hashlib
 import math
 import os
+import re
 import time
+import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +16,7 @@ import azure.functions as func
 from solve_vrp import solve_vrp_nearest_neighbor
 from solve_vrp.here_emulator import HerePlatformEmulator
 from solve_vrp.here_platform import HerePlatformClient
+from solve_vrp.scraping_cache import MemoryTTLCache, RedisScrapingCache, ScrapingCache
 from solve_vrp.semantic_layer import build_semantic_layer
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -44,6 +48,23 @@ DEFAULT_POI_AUTO_MAX_CANDIDATES = 250
 DEFAULT_POI_AUTO_CHUNK_SIZE = 3
 DEFAULT_POI_AUTO_MAX_CHUNK_QUERIES = 4
 DEFAULT_POI_AUTO_MAX_ENDPOINTS = 4
+SCRAPING_TEMP_FILENAME = "social_scraping_latest.txt"
+DEFAULT_SCRAPING_KEYWORDS = (
+    "accident OR robbery OR protest OR fire OR risk OR flood OR storm OR incident"
+)
+DEFAULT_SCRAPING_PER_LOCATION_LIMIT = 5
+DEFAULT_SCRAPING_RADIUS_KM = 15
+DEFAULT_SCRAPING_MINUTES_BACK = 30
+DEFAULT_SCRAPING_PREVIEW_LIMIT = 60
+DEFAULT_SCRAPING_FALLBACK_MAX_POSTS = 3
+DEFAULT_SCRAPING_CACHE_TTL_SEC = 1800
+DEFAULT_SCRAPING_CACHE_GEOHASH_PRECISION = 6
+DEFAULT_SCRAPING_CACHE_MAX_ERRORS = 20
+DEFAULT_SCRAPING_CACHE_BACKEND = "memory"
+DEFAULT_SCRAPING_STAGE_POLICY = "enrich_only"
+DEFAULT_BLUESKY_API_BASE = "https://api.bsky.app"
+SCRAPING_CACHE_KEY_VERSION = "v2"
+_SCRAPING_MEMORY_CACHE = MemoryTTLCache(max_entries=5000)
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -74,6 +95,1145 @@ def _safe_float(value, default=None):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _value_to_serializable(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return ""
+    if isinstance(value, (int, bool)):
+        return value
+    if isinstance(value, float):
+        return round(value, 6)
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except Exception:  # noqa: BLE001 - fallback keeps responses stable
+            pass
+    return str(value)
+
+
+def _dedupe_text_values(values):
+    out = []
+    seen = set()
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _normalize_text_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFD", text.casefold())
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+
+
+def _location_slug(value: Any) -> str:
+    normalized = _normalize_text_key(value)
+    if not normalized:
+        return ""
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized)
+    return slug.strip("-")
+
+
+def _iter_routes_from_payload(result_payload: dict) -> List[dict]:
+    routes: List[dict] = []
+    if not isinstance(result_payload, dict):
+        return routes
+
+    root_routes = result_payload.get("routes")
+    if isinstance(root_routes, list):
+        routes.extend(route for route in root_routes if isinstance(route, dict))
+
+    semantic = result_payload.get("semantic_layer")
+    if isinstance(semantic, dict):
+        semantic_routes = semantic.get("routes")
+        if isinstance(semantic_routes, list):
+            routes.extend(route for route in semantic_routes if isinstance(route, dict))
+    return routes
+
+
+def _resolve_municipality_coordinate(
+    result_payload: dict, location_name: str
+) -> Optional[Dict[str, Any]]:
+    target_key = _normalize_text_key(location_name)
+    if not target_key or not isinstance(result_payload, dict):
+        return None
+
+    semantic = result_payload.get("semantic_layer")
+    if isinstance(semantic, dict):
+        address_book = semantic.get("municipality_address_book")
+        if isinstance(address_book, dict):
+            for row in address_book.values():
+                if not isinstance(row, dict):
+                    continue
+                row_name = row.get("municipality_name")
+                if _normalize_text_key(row_name) != target_key:
+                    continue
+                lat = _safe_float(row.get("lat"), None)
+                lng = _safe_float(row.get("lng"), None)
+                if lat is None or lng is None:
+                    continue
+                return {
+                    "lat": round(float(lat), 6),
+                    "lng": round(float(lng), 6),
+                    "coordinate_source": "address_book",
+                }
+
+    routes = _iter_routes_from_payload(result_payload)
+    for route in routes:
+        segments = route.get("segment_context")
+        if not isinstance(segments, list):
+            continue
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            municipality_trace = segment.get("municipality_trace")
+            if not isinstance(municipality_trace, list):
+                continue
+            for trace_item in municipality_trace:
+                if not isinstance(trace_item, dict):
+                    continue
+                municipality_obj = (
+                    trace_item.get("municipality")
+                    if isinstance(trace_item.get("municipality"), dict)
+                    else {}
+                )
+                candidate_name = (
+                    municipality_obj.get("name")
+                    or trace_item.get("municipality_name")
+                    or trace_item.get("name")
+                )
+                if _normalize_text_key(candidate_name) != target_key:
+                    continue
+                lat = _safe_float(municipality_obj.get("lat"), None)
+                lng = _safe_float(municipality_obj.get("lng"), None)
+                if lat is None or lng is None:
+                    query_point = (
+                        trace_item.get("query_point")
+                        if isinstance(trace_item.get("query_point"), dict)
+                        else {}
+                    )
+                    lat = _safe_float(query_point.get("lat"), None)
+                    lng = _safe_float(query_point.get("lng"), None)
+                if lat is None or lng is None:
+                    continue
+                return {
+                    "lat": round(float(lat), 6),
+                    "lng": round(float(lng), 6),
+                    "coordinate_source": "segment_trace",
+                }
+
+    for route in routes:
+        segments = route.get("segment_context")
+        if not isinstance(segments, list):
+            continue
+        segment_by_index: Dict[int, dict] = {}
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            segment_index = segment.get("segment_index")
+            if isinstance(segment_index, int):
+                segment_by_index[segment_index] = segment
+
+        municipality_llm = (
+            route.get("municipality_llm")
+            if isinstance(route.get("municipality_llm"), dict)
+            else {}
+        )
+        additions = (
+            municipality_llm.get("added_municipalities")
+            if isinstance(municipality_llm.get("added_municipalities"), list)
+            else []
+        )
+        for row in additions:
+            if not isinstance(row, dict):
+                continue
+            if _normalize_text_key(row.get("name")) != target_key:
+                continue
+            segment_index = row.get("segment_index")
+            if not isinstance(segment_index, int):
+                continue
+            segment = segment_by_index.get(segment_index)
+            midpoint = (
+                segment.get("midpoint")
+                if isinstance(segment, dict) and isinstance(segment.get("midpoint"), dict)
+                else {}
+            )
+            lat = _safe_float(midpoint.get("lat"), None)
+            lng = _safe_float(midpoint.get("lng"), None)
+            if lat is None or lng is None:
+                continue
+            return {
+                "lat": round(float(lat), 6),
+                "lng": round(float(lng), 6),
+                "coordinate_source": "segment_midpoint",
+            }
+
+    return None
+
+
+def _parse_scraping_cache_backend(value: Any) -> str:
+    backend = str(value or DEFAULT_SCRAPING_CACHE_BACKEND).strip().lower()
+    if backend in {"redis", "memory", "none"}:
+        return backend
+    return DEFAULT_SCRAPING_CACHE_BACKEND
+
+
+def _resolve_scraping_stage_policy(payload: dict) -> str:
+    raw = str(
+        payload.get("scraping_stage", DEFAULT_SCRAPING_STAGE_POLICY)
+        if isinstance(payload, dict)
+        else DEFAULT_SCRAPING_STAGE_POLICY
+    ).strip().lower()
+    if raw in {"both", "all"}:
+        return "both"
+    if raw in {"solve_only", "solve-only", "solve"}:
+        return "solve_only"
+    if raw in {"enrich_only", "enrich-only", "enrich"}:
+        return "enrich_only"
+    return DEFAULT_SCRAPING_STAGE_POLICY
+
+
+def _is_scraping_stage_allowed(source_stage: str, policy: str) -> bool:
+    normalized_stage = str(source_stage or "").strip().lower()
+    if policy == "both":
+        return True
+    if policy == "solve_only":
+        return normalized_stage == "solve_vrp"
+    return normalized_stage == "enrich_municipality"
+
+
+def _resolve_bluesky_api_base(raw_value: Any) -> Tuple[str, Optional[str]]:
+    raw = str(raw_value or DEFAULT_BLUESKY_API_BASE).strip()
+    if not raw:
+        raw = DEFAULT_BLUESKY_API_BASE
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urllib.parse.urlparse(raw)
+    host = (parsed.netloc or "").strip().casefold()
+    scheme = (parsed.scheme or "https").strip().lower() or "https"
+    path = (parsed.path or "").rstrip("/")
+    effective = raw.rstrip("/")
+
+    if host == "public.api.bsky.app":
+        effective = f"{scheme}://api.bsky.app{path}"
+        return (
+            effective,
+            (
+                "BLUESKY_API_BASE public.api.bsky.app is deprecated for searchPosts; "
+                "using https://api.bsky.app instead."
+            ),
+        )
+
+    return effective, None
+
+
+def _bounded_append_error(errors: List[str], message: str, max_errors: int) -> None:
+    if len(errors) >= max_errors:
+        return
+    errors.append(str(message))
+
+
+def _build_scraping_cache_key(
+    query_type: str,
+    geohash_or_loc: str,
+    keywords: str,
+    minutes_back: int,
+    limit: int,
+    api_base: str,
+) -> str:
+    keywords_hash = hashlib.sha1(
+        str(keywords or "").strip().casefold().encode("utf-8")
+    ).hexdigest()[:12]
+    base_hash = hashlib.sha1(
+        str(api_base or "").strip().casefold().encode("utf-8")
+    ).hexdigest()[:8]
+    loc_token = str(geohash_or_loc or "unknown").strip().lower() or "unknown"
+    return (
+        f"scrape:{SCRAPING_CACHE_KEY_VERSION}:{query_type}:{base_hash}:{loc_token}:"
+        f"{keywords_hash}:{int(minutes_back)}:{int(limit)}"
+    )
+
+
+def _encode_geohash(lat: Optional[float], lng: Optional[float], precision: int) -> str:
+    if lat is None or lng is None:
+        return ""
+    try:
+        import pygeohash as pgh  # type: ignore
+    except Exception:
+        return ""
+    try:
+        return str(pgh.encode(float(lat), float(lng), precision=max(1, int(precision))))
+    except Exception:
+        return ""
+
+
+def _create_scraping_cache(
+    errors: List[str], max_errors: int
+) -> Tuple[Optional[ScrapingCache], str]:
+    backend = _parse_scraping_cache_backend(os.getenv("SCRAPING_CACHE_BACKEND", "memory"))
+    redis_url = str(os.getenv("SCRAPING_CACHE_REDIS_URL", "")).strip()
+
+    if backend == "none":
+        return None, "none"
+
+    if backend == "redis":
+        if not redis_url:
+            _bounded_append_error(
+                errors,
+                "Redis backend configured without SCRAPING_CACHE_REDIS_URL; using memory fallback.",
+                max_errors=max_errors,
+            )
+            return _SCRAPING_MEMORY_CACHE, "memory"
+        try:
+            return RedisScrapingCache(redis_url=redis_url), "redis"
+        except Exception as exc:  # noqa: BLE001 - cache failures must not break solve flow
+            _bounded_append_error(
+                errors,
+                f"Redis cache unavailable; using memory fallback. Reason: {exc}",
+                max_errors=max_errors,
+            )
+            return _SCRAPING_MEMORY_CACHE, "memory"
+
+    return _SCRAPING_MEMORY_CACHE, "memory"
+
+
+def _collect_route_municipality_names(result_payload: dict) -> List[str]:
+    names: List[Any] = []
+
+    def collect_from_routes(routes: List[dict]) -> None:
+        for route in routes:
+            links = route.get("stop_municipality_links")
+            if isinstance(links, list):
+                for link in links:
+                    if isinstance(link, dict):
+                        names.append(link.get("municipality_name"))
+
+            segments = route.get("segment_context")
+            if isinstance(segments, list):
+                for segment in segments:
+                    if not isinstance(segment, dict):
+                        continue
+                    municipality_names = segment.get("municipality_names")
+                    if isinstance(municipality_names, list):
+                        names.extend(municipality_names)
+
+                    municipality_trace = segment.get("municipality_trace")
+                    if isinstance(municipality_trace, list):
+                        for trace_item in municipality_trace:
+                            if not isinstance(trace_item, dict):
+                                continue
+                            names.append(trace_item.get("municipality_name"))
+                            municipality_obj = trace_item.get("municipality")
+                            if isinstance(municipality_obj, dict):
+                                names.append(municipality_obj.get("name"))
+
+            municipality_vector = route.get("municipality_vector")
+            if isinstance(municipality_vector, list):
+                names.extend(municipality_vector)
+
+    collect_from_routes(_iter_routes_from_payload(result_payload))
+
+    semantic = result_payload.get("semantic_layer") if isinstance(result_payload, dict) else None
+
+    if isinstance(semantic, dict):
+        address_book = semantic.get("municipality_address_book")
+        if isinstance(address_book, dict):
+            for row in address_book.values():
+                if isinstance(row, dict):
+                    names.append(row.get("municipality_name"))
+
+    return _dedupe_text_values(names)
+
+
+def _write_scraping_temp_file(report_text: str) -> Dict[str, str]:
+    base_dir = os.path.dirname(__file__)
+    latest_path = os.path.join(base_dir, SCRAPING_TEMP_FILENAME)
+    snapshot_name = (
+        "social_scraping_"
+        + datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        + ".txt"
+    )
+    snapshot_path = os.path.join(base_dir, snapshot_name)
+
+    latest_error = ""
+    snapshot_error = ""
+
+    try:
+        with open(latest_path, "w", encoding="utf-8") as handle:
+            handle.write(report_text)
+    except Exception as exc:  # noqa: BLE001 - diagnostics should not fail solve flow
+        latest_error = str(exc)
+
+    try:
+        with open(snapshot_path, "w", encoding="utf-8") as handle:
+            handle.write(report_text)
+    except Exception as exc:  # noqa: BLE001 - diagnostics should not fail solve flow
+        snapshot_error = str(exc)
+
+    return {
+        "path": latest_path,
+        "error": latest_error,
+        "snapshot_path": snapshot_path,
+        "snapshot_error": snapshot_error,
+    }
+
+
+def _build_scraping_report_text(meta: dict) -> str:
+    lines = []
+    lines.append("Social scraping report (Bluesky)")
+    generated_at_utc = str(meta.get("generated_at_utc", "")).strip()
+    if not generated_at_utc:
+        generated_at_utc = datetime.now(tz=timezone.utc).isoformat()
+    lines.append(f"generated_at_utc: {generated_at_utc}")
+    source_stage = str(meta.get("source_stage", "")).strip()
+    if source_stage:
+        lines.append(f"source_stage: {source_stage}")
+    lines.append(f"stage_policy: {meta.get('stage_policy', DEFAULT_SCRAPING_STAGE_POLICY)}")
+    lines.append(f"stage_allowed: {meta.get('stage_allowed', False)}")
+    stage_skip_reason = str(meta.get("stage_skip_reason", "")).strip()
+    if stage_skip_reason:
+        lines.append(f"stage_skip_reason: {stage_skip_reason}")
+    lines.append(f"status: {meta.get('status', 'unknown')}")
+    lines.append(f"message: {meta.get('message', '')}")
+    lines.append(f"keywords: {meta.get('keywords', '')}")
+    lines.append(f"locations_requested: {meta.get('locations_requested', 0)}")
+
+    requested_keys = meta.get("locations_requested_keys", [])
+    requested_names = meta.get("locations_requested_names", [])
+    if isinstance(requested_keys, list) and requested_keys:
+        lines.append(f"locations_requested_keys: {', '.join(str(x) for x in requested_keys)}")
+    if isinstance(requested_names, list) and requested_names:
+        lines.append(
+            f"locations_requested_names: {', '.join(str(x) for x in requested_names)}"
+        )
+
+    lines.append(f"locations_with_results: {meta.get('locations_with_results', 0)}")
+    lines.append(f"tweets_total: {meta.get('tweets_total', 0)}")
+    lines.append(f"per_location_limit: {meta.get('per_location_limit', 0)}")
+    lines.append(f"risk_posts_total: {meta.get('risk_posts_total', 0)}")
+    lines.append(f"fallback_posts_total: {meta.get('fallback_posts_total', 0)}")
+    lines.append(f"locations_with_risk: {meta.get('locations_with_risk', 0)}")
+    lines.append(f"locations_with_fallback: {meta.get('locations_with_fallback', 0)}")
+    lines.append(f"fallback_mode_used: {meta.get('fallback_mode_used', False)}")
+    lines.append(f"cache_backend: {meta.get('cache_backend', 'none')}")
+    lines.append(
+        f"bluesky_api_base_effective: {meta.get('bluesky_api_base_effective', '')}"
+    )
+    lines.append(f"cache_key_version: {meta.get('cache_key_version', SCRAPING_CACHE_KEY_VERSION)}")
+    lines.append(f"cache_hits: {meta.get('cache_hits', 0)}")
+    lines.append(f"cache_misses: {meta.get('cache_misses', 0)}")
+    lines.append(f"cache_writes: {meta.get('cache_writes', 0)}")
+    lines.append(f"network_queries_attempted: {meta.get('network_queries_attempted', 0)}")
+    lines.append(f"network_queries_succeeded: {meta.get('network_queries_succeeded', 0)}")
+    network_errors = meta.get("network_errors", [])
+    if isinstance(network_errors, list) and network_errors:
+        lines.append("network_errors:")
+        for err in network_errors:
+            lines.append(f"- {err}")
+    else:
+        lines.append("network_errors: none")
+    lines.append("")
+    lines.append("results_by_location:")
+
+    by_location = meta.get("results_by_location", {})
+    if isinstance(by_location, dict) and by_location:
+        for location_name, count in by_location.items():
+            lines.append(f"- {location_name}: {count}")
+    else:
+        lines.append("- none")
+
+    lines.append("")
+    lines.append("preview_rows:")
+    preview_rows = meta.get("preview_rows", [])
+    if isinstance(preview_rows, list) and preview_rows:
+        for row in preview_rows:
+            if not isinstance(row, dict):
+                continue
+            created_at = row.get("created_at", "")
+            location_name = row.get("location_name", "")
+            username = row.get("username", "")
+            classification = str(row.get("classification", "")).strip()
+            text = str(row.get("text", "")).strip()
+            tweet_url = str(row.get("tweet_url", "")).strip()
+            if len(text) > 240:
+                text = text[:237] + "..."
+            prefix = f"[{classification}] " if classification else ""
+            lines.append(
+                f"- [{created_at}] {prefix}{location_name} @{username}: {text}"
+            )
+            if tweet_url:
+                lines.append(f"  {tweet_url}")
+    else:
+        lines.append("- none")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _run_social_scraping(
+    payload: dict,
+    municipality_names: List[str],
+    source_stage: str = "solve_vrp",
+    result_payload: Optional[dict] = None,
+) -> dict:
+    enabled = _as_bool(payload.get("scraping_enabled"), False)
+    generated_at_utc = datetime.now(tz=timezone.utc).isoformat()
+    stage_policy = _resolve_scraping_stage_policy(payload)
+    stage_allowed = _is_scraping_stage_allowed(source_stage=source_stage, policy=stage_policy)
+    force_refresh = _as_bool(payload.get("scraping_force_refresh"), False)
+
+    requested_locations_raw = payload.get("scraping_locations")
+    requested_locations_explicit = (
+        _dedupe_text_values(requested_locations_raw)
+        if isinstance(requested_locations_raw, list)
+        else []
+    )
+    municipality_locations = _dedupe_text_values(municipality_names or [])
+    requested_location_names = (
+        requested_locations_explicit
+        if requested_locations_explicit
+        else municipality_locations
+    )
+
+    max_cache_errors = max(
+        1,
+        _safe_int(
+            os.getenv("SCRAPING_CACHE_MAX_ERRORS"), DEFAULT_SCRAPING_CACHE_MAX_ERRORS
+        ),
+    )
+
+    cache_errors: List[str] = []
+    network_errors: List[str] = []
+    cache_backend: str = "none"
+
+    meta = {
+        "enabled": enabled,
+        "generated_at_utc": generated_at_utc,
+        "source_stage": str(source_stage or "solve_vrp"),
+        "stage_policy": stage_policy,
+        "stage_allowed": stage_allowed,
+        "stage_skip_reason": "",
+        "status": "disabled",
+        "message": "Social scraping disabled.",
+        "keywords": "",
+        "locations_requested": len(requested_location_names),
+        "locations_requested_keys": list(requested_location_names),
+        "locations_requested_names": list(requested_location_names),
+        "locations_with_results": 0,
+        "tweets_total": 0,
+        "per_location_limit": 0,
+        "results_by_location": {},
+        "preview_rows": [],
+        "cache_backend": cache_backend,
+        "bluesky_api_base_effective": "",
+        "cache_key_version": SCRAPING_CACHE_KEY_VERSION,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_writes": 0,
+        "cache_errors": cache_errors,
+        "network_queries_attempted": 0,
+        "network_queries_succeeded": 0,
+        "network_errors": network_errors,
+        "risk_posts_total": 0,
+        "fallback_posts_total": 0,
+        "locations_with_risk": 0,
+        "locations_with_fallback": 0,
+        "fallback_mode_used": False,
+        "municipality_points": [],
+        "unresolved_locations_for_icons": [],
+        "scraping_force_refresh": force_refresh,
+    }
+
+    raw_bluesky_api_base = os.getenv("BLUESKY_API_BASE", DEFAULT_BLUESKY_API_BASE)
+    bluesky_api_base, api_base_warning = _resolve_bluesky_api_base(raw_bluesky_api_base)
+    meta["bluesky_api_base_effective"] = bluesky_api_base
+    if api_base_warning:
+        _bounded_append_error(network_errors, api_base_warning, max_errors=max_cache_errors)
+
+    if not enabled:
+        return meta
+
+    if not stage_allowed:
+        stage_skip_reason = (
+            f"source_stage={source_stage} is blocked by scraping_stage={stage_policy}."
+        )
+        meta.update(
+            status="skipped_stage",
+            stage_skip_reason=stage_skip_reason,
+            message=(
+                "Scraping skipped because the current stage is blocked by "
+                "scraping_stage policy."
+            ),
+        )
+        file_write = _write_scraping_temp_file(_build_scraping_report_text(meta))
+        meta["output_file"] = file_write["path"]
+        if file_write["error"]:
+            meta["output_file_error"] = file_write["error"]
+        meta["output_file_snapshot"] = file_write["snapshot_path"]
+        if file_write["snapshot_error"]:
+            meta["output_file_snapshot_error"] = file_write["snapshot_error"]
+        return meta
+
+    cache: Optional[ScrapingCache] = None
+    cache, cache_backend = _create_scraping_cache(
+        errors=cache_errors, max_errors=max_cache_errors
+    )
+    meta["cache_backend"] = cache_backend
+
+    if not requested_location_names:
+        meta.update(
+            status="skipped",
+            message=(
+                "No municipality locations were found in routes. "
+                "Run Municipality Trace first or pass scraping_locations."
+            ),
+        )
+        file_write = _write_scraping_temp_file(_build_scraping_report_text(meta))
+        meta["output_file"] = file_write["path"]
+        if file_write["error"]:
+            meta["output_file_error"] = file_write["error"]
+        meta["output_file_snapshot"] = file_write["snapshot_path"]
+        if file_write["snapshot_error"]:
+            meta["output_file_snapshot_error"] = file_write["snapshot_error"]
+        return meta
+
+    try:
+        from solve_vrp.social_geo_scraper import SocialGeoScraper
+    except Exception as exc:  # noqa: BLE001 - response should still include diagnostics
+        meta.update(
+            status="unavailable",
+            message=f"Social scraper dependencies unavailable: {exc}",
+        )
+        file_write = _write_scraping_temp_file(_build_scraping_report_text(meta))
+        meta["output_file"] = file_write["path"]
+        if file_write["error"]:
+            meta["output_file_error"] = file_write["error"]
+        meta["output_file_snapshot"] = file_write["snapshot_path"]
+        if file_write["snapshot_error"]:
+            meta["output_file_snapshot_error"] = file_write["snapshot_error"]
+        return meta
+
+    keywords = str(payload.get("scraping_keywords", DEFAULT_SCRAPING_KEYWORDS)).strip()
+    if not keywords:
+        keywords = DEFAULT_SCRAPING_KEYWORDS
+    per_location_limit = max(
+        1,
+        min(
+            _safe_int(
+                payload.get("scraping_per_location_limit"),
+                DEFAULT_SCRAPING_PER_LOCATION_LIMIT,
+            ),
+            100,
+        ),
+    )
+    fallback_max_posts = max(
+        1,
+        min(
+            _safe_int(
+                payload.get("scraping_fallback_max_posts"),
+                _safe_int(
+                    os.getenv("SCRAPING_FALLBACK_MAX_POSTS"),
+                    DEFAULT_SCRAPING_FALLBACK_MAX_POSTS,
+                ),
+            ),
+            3,
+        ),
+    )
+    radius_km = max(
+        1, _safe_int(payload.get("scraping_radius_km"), DEFAULT_SCRAPING_RADIUS_KM)
+    )
+    minutes_back = max(
+        1, _safe_int(payload.get("scraping_minutes_back"), DEFAULT_SCRAPING_MINUTES_BACK)
+    )
+    pause_seconds = max(
+        0.0, _safe_float(payload.get("scraping_pause_seconds"), 0.0) or 0.0
+    )
+    preview_limit = max(
+        1,
+        min(
+            _safe_int(payload.get("scraping_preview_limit"), DEFAULT_SCRAPING_PREVIEW_LIMIT),
+            200,
+        ),
+    )
+    cache_ttl_sec = max(
+        10,
+        _safe_int(os.getenv("SCRAPING_CACHE_TTL_SEC"), DEFAULT_SCRAPING_CACHE_TTL_SEC),
+    )
+    geohash_precision = max(
+        1,
+        min(
+            _safe_int(
+                os.getenv("SCRAPING_CACHE_GEOHASH_PRECISION"),
+                DEFAULT_SCRAPING_CACHE_GEOHASH_PRECISION,
+            ),
+            12,
+        ),
+    )
+
+    cache_hits = 0
+    cache_misses = 0
+    cache_writes = 0
+    active_cache = cache
+    active_cache_backend = cache_backend
+    network_queries_attempted = 0
+    network_queries_succeeded = 0
+
+    def _degrade_cache_if_needed(reason: str) -> None:
+        nonlocal active_cache, active_cache_backend
+        if active_cache_backend != "redis":
+            return
+        _bounded_append_error(
+            cache_errors,
+            f"Redis cache error; using memory fallback. Reason: {reason}",
+            max_errors=max_cache_errors,
+        )
+        active_cache = _SCRAPING_MEMORY_CACHE
+        active_cache_backend = "memory"
+
+    def _is_valid_cached_row(row: dict) -> bool:
+        if not isinstance(row, dict):
+            return False
+        source_platform = str(row.get("source_platform", "")).strip().lower()
+        if source_platform and source_platform != "bluesky":
+            return False
+        tweet_url = str(row.get("tweet_url", "")).strip()
+        if tweet_url and not tweet_url.startswith("https://bsky.app/profile/"):
+            return False
+        post_uri = str(row.get("post_uri", "")).strip()
+        if post_uri and not post_uri.startswith("at://"):
+            return False
+        return True
+
+    def _extract_cached_rows(
+        payload_row: dict, expected_query_type: str, max_rows: int
+    ) -> Optional[List[dict]]:
+        if not isinstance(payload_row, dict):
+            return None
+        if str(payload_row.get("version", "")).strip() != SCRAPING_CACHE_KEY_VERSION:
+            return None
+        if str(payload_row.get("query_type", "")).strip().lower() != expected_query_type:
+            return None
+        rows = payload_row.get("rows")
+        if not isinstance(rows, list):
+            return None
+        normalized_rows: List[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            if not _is_valid_cached_row(row):
+                return None
+            normalized_rows.append(row)
+        return normalized_rows[:max_rows]
+
+    def _cache_get_rows(
+        key: str, expected_query_type: str, max_rows: int
+    ) -> Optional[List[dict]]:
+        nonlocal cache_hits, cache_misses, active_cache
+        if force_refresh:
+            return None
+        if active_cache is None:
+            return None
+        try:
+            payload_row = active_cache.get(key)
+        except Exception as exc:  # noqa: BLE001
+            _degrade_cache_if_needed(str(exc))
+            if active_cache is not None and active_cache_backend == "memory":
+                try:
+                    payload_row = active_cache.get(key)
+                except Exception as fallback_exc:  # noqa: BLE001
+                    _bounded_append_error(
+                        cache_errors,
+                        f"Memory cache get failed: {fallback_exc}",
+                        max_errors=max_cache_errors,
+                    )
+                    return None
+            else:
+                return None
+
+        cached_rows = _extract_cached_rows(
+            payload_row=payload_row if isinstance(payload_row, dict) else {},
+            expected_query_type=expected_query_type,
+            max_rows=max_rows,
+        )
+        if cached_rows is None:
+            cache_misses += 1
+            return None
+        cache_hits += 1
+        return cached_rows
+
+    def _cache_set(key: str, value: dict) -> None:
+        nonlocal cache_writes, active_cache
+        if active_cache is None:
+            return
+        try:
+            active_cache.set(key, value, cache_ttl_sec)
+            cache_writes += 1
+            return
+        except Exception as exc:  # noqa: BLE001
+            _degrade_cache_if_needed(str(exc))
+            if active_cache is None or active_cache_backend != "memory":
+                return
+            try:
+                active_cache.set(key, value, cache_ttl_sec)
+                cache_writes += 1
+            except Exception as fallback_exc:  # noqa: BLE001
+                _bounded_append_error(
+                    cache_errors,
+                    f"Memory cache set failed: {fallback_exc}",
+                    max_errors=max_cache_errors,
+                )
+
+    def _normalize_preview_row(
+        row: dict,
+        location_name: str,
+        classification: str,
+        is_fallback: bool,
+        location_coord: Optional[Dict[str, Any]],
+    ) -> dict:
+        text = " ".join(str(_value_to_serializable(row.get("text", ""))).split())
+        location_lat = (
+            _safe_float(location_coord.get("lat"), None)
+            if isinstance(location_coord, dict)
+            else None
+        )
+        location_lng = (
+            _safe_float(location_coord.get("lng"), None)
+            if isinstance(location_coord, dict)
+            else None
+        )
+        return {
+            "created_at": _value_to_serializable(row.get("created_at")),
+            "location_key": location_name,
+            "location_name": location_name,
+            "username": _value_to_serializable(row.get("username")),
+            "tweet_id": _value_to_serializable(row.get("tweet_id")),
+            "text": text,
+            "tweet_url": _value_to_serializable(row.get("tweet_url")),
+            "post_uri": _value_to_serializable(row.get("post_uri")),
+            "like_count": _value_to_serializable(row.get("like_count")),
+            "retweet_count": _value_to_serializable(row.get("retweet_count")),
+            "reply_count": _value_to_serializable(row.get("reply_count")),
+            "source_platform": _value_to_serializable(row.get("source_platform")),
+            "classification": classification,
+            "is_fallback": is_fallback,
+            "location_lat": round(float(location_lat), 6) if location_lat is not None else None,
+            "location_lng": round(float(location_lng), 6) if location_lng is not None else None,
+        }
+
+    def _append_post_url_warning(row: dict, location_name: str, classification: str) -> None:
+        tweet_url = str(row.get("tweet_url", "")).strip()
+        post_uri = str(row.get("post_uri", "")).strip()
+        if tweet_url or not post_uri:
+            return
+        _bounded_append_error(
+            network_errors,
+            (
+                f"{location_name} ({classification}): could not build a bsky.app URL "
+                f"for post_uri={post_uri}"
+            ),
+            max_errors=max_cache_errors,
+        )
+
+    try:
+        bluesky_identifier = str(os.getenv("BLUESKY_IDENTIFIER", "")).strip()
+        bluesky_app_password = str(os.getenv("BLUESKY_APP_PASSWORD", "")).strip()
+        timeout_sec = max(3, _safe_int(os.getenv("BLUESKY_TIMEOUT_SEC"), 10))
+
+        scraper = SocialGeoScraper(
+            bluesky_api_base=bluesky_api_base,
+            bluesky_identifier=bluesky_identifier,
+            bluesky_app_password=bluesky_app_password,
+            timeout_sec=timeout_sec,
+        )
+        by_location: Dict[str, int] = {}
+        preview_rows: List[dict] = []
+        skipped_locations: List[str] = []
+        municipality_points: List[dict] = []
+        unresolved_locations_for_icons: List[str] = []
+        unresolved_seen = set()
+        tweets_total = 0
+        risk_posts_total = 0
+        fallback_posts_total = 0
+        locations_with_results = 0
+        locations_with_risk = 0
+        locations_with_fallback = 0
+        fallback_mode_used = False
+
+        for index, location_name in enumerate(requested_location_names, start=1):
+            location_coord = (
+                _resolve_municipality_coordinate(result_payload, location_name)
+                if isinstance(result_payload, dict)
+                else None
+            )
+            geohash_token = _encode_geohash(
+                _safe_float(location_coord.get("lat"), None)
+                if isinstance(location_coord, dict)
+                else None,
+                _safe_float(location_coord.get("lng"), None)
+                if isinstance(location_coord, dict)
+                else None,
+                precision=geohash_precision,
+            )
+            location_cache_token = geohash_token or _location_slug(location_name) or "unknown"
+
+            risk_key = _build_scraping_cache_key(
+                query_type="risk",
+                geohash_or_loc=location_cache_token,
+                keywords=keywords,
+                minutes_back=minutes_back,
+                limit=per_location_limit,
+                api_base=bluesky_api_base,
+            )
+            risk_rows: List[dict] = []
+            cached_risk_rows = _cache_get_rows(
+                key=risk_key,
+                expected_query_type="risk",
+                max_rows=per_location_limit,
+            )
+            if cached_risk_rows is not None:
+                risk_rows = cached_risk_rows
+            else:
+                network_queries_attempted += 1
+                try:
+                    search_results = scraper.search_recent_posts(
+                        location_name=location_name,
+                        keywords=keywords,
+                        per_location_limit=per_location_limit,
+                        minutes_back=minutes_back,
+                    )
+                    network_queries_succeeded += 1
+                except Exception as exc:  # noqa: BLE001 - non-blocking per location
+                    skipped_locations.append(f"{location_name}: {exc}")
+                    _bounded_append_error(
+                        network_errors,
+                        f"{location_name}: {exc}",
+                        max_errors=max_cache_errors,
+                    )
+                    search_results = []
+                risk_rows = [row for row in search_results if isinstance(row, dict)][
+                    :per_location_limit
+                ]
+                _cache_set(
+                    risk_key,
+                    {
+                        "version": SCRAPING_CACHE_KEY_VERSION,
+                        "query_type": "risk",
+                        "rows": risk_rows,
+                        "risk_count": len(risk_rows),
+                        "fallback_count": 0,
+                        "generated_at_utc": datetime.now(tz=timezone.utc).isoformat(),
+                    },
+                )
+
+            fallback_rows: List[dict] = []
+            if len(risk_rows) == 0:
+                fallback_mode_used = True
+                fallback_key = _build_scraping_cache_key(
+                    query_type="fallback",
+                    geohash_or_loc=location_cache_token,
+                    keywords="",
+                    minutes_back=minutes_back,
+                    limit=fallback_max_posts,
+                    api_base=bluesky_api_base,
+                )
+                cached_fallback_rows = _cache_get_rows(
+                    key=fallback_key,
+                    expected_query_type="fallback",
+                    max_rows=fallback_max_posts,
+                )
+                if cached_fallback_rows is not None:
+                    fallback_rows = cached_fallback_rows
+                else:
+                    network_queries_attempted += 1
+                    try:
+                        fallback_results = scraper.search_recent_posts(
+                            location_name=location_name,
+                            keywords="",
+                            per_location_limit=fallback_max_posts,
+                            minutes_back=minutes_back,
+                        )
+                        network_queries_succeeded += 1
+                    except Exception as exc:  # noqa: BLE001 - non-blocking per location
+                        skipped_locations.append(f"{location_name} (fallback): {exc}")
+                        _bounded_append_error(
+                            network_errors,
+                            f"{location_name} (fallback): {exc}",
+                            max_errors=max_cache_errors,
+                        )
+                        fallback_results = []
+                    fallback_rows = [
+                        row for row in fallback_results if isinstance(row, dict)
+                    ][:fallback_max_posts]
+                    _cache_set(
+                        fallback_key,
+                        {
+                            "version": SCRAPING_CACHE_KEY_VERSION,
+                            "query_type": "fallback",
+                            "rows": fallback_rows,
+                            "risk_count": 0,
+                            "fallback_count": len(fallback_rows),
+                            "generated_at_utc": datetime.now(tz=timezone.utc).isoformat(),
+                        },
+                    )
+
+            risk_count = len(risk_rows)
+            fallback_count = len(fallback_rows)
+            combined_count = risk_count + fallback_count
+            by_location[location_name] = combined_count
+
+            if risk_count > 0:
+                locations_with_risk += 1
+            if fallback_count > 0:
+                locations_with_fallback += 1
+            if combined_count > 0:
+                locations_with_results += 1
+
+            risk_posts_total += risk_count
+            fallback_posts_total += fallback_count
+            tweets_total += combined_count
+
+            for row in risk_rows:
+                _append_post_url_warning(
+                    row=row, location_name=location_name, classification="risk"
+                )
+                preview_rows.append(
+                    _normalize_preview_row(
+                        row=row,
+                        location_name=location_name,
+                        classification="risk",
+                        is_fallback=False,
+                        location_coord=location_coord,
+                    )
+                )
+            for row in fallback_rows:
+                _append_post_url_warning(
+                    row=row, location_name=location_name, classification="fallback_info"
+                )
+                preview_rows.append(
+                    _normalize_preview_row(
+                        row=row,
+                        location_name=location_name,
+                        classification="fallback_info",
+                        is_fallback=True,
+                        location_coord=location_coord,
+                    )
+                )
+
+            if combined_count > 0:
+                lat = (
+                    _safe_float(location_coord.get("lat"), None)
+                    if isinstance(location_coord, dict)
+                    else None
+                )
+                lng = (
+                    _safe_float(location_coord.get("lng"), None)
+                    if isinstance(location_coord, dict)
+                    else None
+                )
+                if lat is None or lng is None:
+                    normalized_name = _normalize_text_key(location_name)
+                    if normalized_name and normalized_name not in unresolved_seen:
+                        unresolved_seen.add(normalized_name)
+                        unresolved_locations_for_icons.append(location_name)
+                else:
+                    municipality_points.append(
+                        {
+                            "location_name": location_name,
+                            "lat": round(float(lat), 6),
+                            "lng": round(float(lng), 6),
+                            "icon_type": "risk" if risk_count > 0 else "info",
+                            "risk_count": risk_count,
+                            "fallback_count": fallback_count,
+                            "coordinate_source": (
+                                str(location_coord.get("coordinate_source") or "segment_midpoint")
+                                if isinstance(location_coord, dict)
+                                else "segment_midpoint"
+                            ),
+                        }
+                    )
+
+            if pause_seconds > 0 and index < len(requested_location_names):
+                time.sleep(pause_seconds)
+
+        if len(preview_rows) > preview_limit:
+            preview_rows = preview_rows[:preview_limit]
+
+        status = "ok" if tweets_total > 0 else "no_results"
+        message = (
+            f"Scraping completed with {tweets_total} posts."
+            if tweets_total > 0
+            else "Scraping completed with no posts."
+        )
+        meta.update(
+            status=status,
+            message=message,
+            keywords=keywords,
+            locations_requested=len(requested_location_names),
+            locations_requested_keys=requested_location_names,
+            locations_requested_names=requested_location_names,
+            locations_with_results=locations_with_results,
+            tweets_total=tweets_total,
+            per_location_limit=per_location_limit,
+            radius_km=radius_km,
+            minutes_back=minutes_back,
+            skipped_locations=skipped_locations,
+            results_by_location=by_location,
+            preview_rows=preview_rows,
+            cache_backend=active_cache_backend,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            cache_writes=cache_writes,
+            cache_errors=cache_errors,
+            network_queries_attempted=network_queries_attempted,
+            network_queries_succeeded=network_queries_succeeded,
+            network_errors=network_errors,
+            risk_posts_total=risk_posts_total,
+            fallback_posts_total=fallback_posts_total,
+            locations_with_risk=locations_with_risk,
+            locations_with_fallback=locations_with_fallback,
+            fallback_mode_used=fallback_mode_used,
+            municipality_points=municipality_points,
+            unresolved_locations_for_icons=unresolved_locations_for_icons,
+            scraping_fallback_max_posts=fallback_max_posts,
+        )
+    except Exception as exc:  # noqa: BLE001 - keep solve endpoint stable
+        meta.update(
+            status="failed",
+            message=f"Social scraping execution failed: {exc}",
+            keywords=keywords,
+            per_location_limit=per_location_limit,
+            radius_km=radius_km,
+            minutes_back=minutes_back,
+            cache_backend=active_cache_backend,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            cache_writes=cache_writes,
+            cache_errors=cache_errors,
+            network_queries_attempted=network_queries_attempted,
+            network_queries_succeeded=network_queries_succeeded,
+            network_errors=network_errors,
+        )
+
+    file_write = _write_scraping_temp_file(_build_scraping_report_text(meta))
+    meta["output_file"] = file_write["path"]
+    if file_write["error"]:
+        meta["output_file_error"] = file_write["error"]
+    meta["output_file_snapshot"] = file_write["snapshot_path"]
+    if file_write["snapshot_error"]:
+        meta["output_file_snapshot_error"] = file_write["snapshot_error"]
+    return meta
 
 
 def _parse_utc_datetime(value):
@@ -1401,6 +2561,22 @@ HTML_PAGE = """
         background: #ffffff;
         display: inline-block;
       }
+      .legend-dot-scrape-risk {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 2px solid #7a1b16;
+        background: #ffcabf;
+        display: inline-block;
+      }
+      .legend-dot-scrape-info {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 2px solid #184c73;
+        background: #d8ecff;
+        display: inline-block;
+      }
       .semantic-poi-icon {
         width: 18px;
         height: 18px;
@@ -1422,6 +2598,30 @@ HTML_PAGE = """
       .semantic-poi-icon.poi-rest {
         border-color: #8b5a00;
         background: #ffe8c2;
+      }
+      .scraping-marker-icon {
+        width: 19px;
+        height: 19px;
+        border-radius: 50%;
+        border: 2px solid #184c73;
+        background: #d8ecff;
+        color: #103c5f;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        font-weight: 700;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+      }
+      .scraping-marker-icon.risk {
+        border-color: #7a1b16;
+        background: #ffcabf;
+        color: #7a1b16;
+      }
+      .scraping-marker-icon.info {
+        border-color: #184c73;
+        background: #d8ecff;
+        color: #103c5f;
       }
       .semantic-popup { font-size: 12px; line-height: 1.35; }
       .semantic-popup h4 { margin: 0 0 5px 0; font-size: 13px; }
@@ -1484,6 +2684,14 @@ HTML_PAGE = """
           <span>Auto semantic POI candidates (OSM/Overpass)</span>
         </label>
         <div class="small">If enabled, backend fetches candidate POIs in phase 2 (when you click <code>Add Municipality Trace</code>).</div>
+      </div>
+
+      <div class="row">
+        <label class="inline-check">
+          <input id="scrapingEnabled" type="checkbox" checked />
+          <span>Bluesky scraping for municipality risk signals</span>
+        </label>
+        <div class="small">When enabled, backend scrapes recent Bluesky posts for the municipalities detected in your routes.</div>
       </div>
 
       <div class="row" style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
@@ -1590,6 +2798,8 @@ HTML_PAGE = """
           <div class="legend-row"><span class="legend-dot-poi-charging"></span><span>POI charging station</span></div>
           <div class="legend-row"><span class="legend-dot-poi-rest"></span><span>POI rest area / services</span></div>
           <div class="legend-row"><span class="legend-dot-segment"></span><span>Segment context marker</span></div>
+          <div class="legend-row"><span class="legend-dot-scrape-risk"></span><span>Social risk marker (!)</span></div>
+          <div class="legend-row"><span class="legend-dot-scrape-info"></span><span>Social fallback marker (i)</span></div>
         </div>
       </div>
     </div>
@@ -1608,6 +2818,7 @@ HTML_PAGE = """
       let markers = [];
       let routeLayers = [];
       let semanticMarkers = [];
+      let scrapingMarkers = [];
       let phase1ExtraMarkers = [];
       let lastCandidateLocations = [];
       let customerId = 1;
@@ -1760,6 +2971,8 @@ HTML_PAGE = """
         routeLayers = [];
         semanticMarkers.forEach(m => map.removeLayer(m));
         semanticMarkers = [];
+        scrapingMarkers.forEach(m => map.removeLayer(m));
+        scrapingMarkers = [];
       }
 
       function setMunicipalityButtonState(enabled, busy = false) {
@@ -1776,6 +2989,12 @@ HTML_PAGE = """
           poi_auto_enabled: enabled,
           poi_auto_radius_km: Number.isFinite(radiusRaw) ? Math.max(0.2, radiusRaw) : 3,
           poi_auto_max_candidates: Number.isFinite(maxRaw) ? Math.max(10, maxRaw) : 25
+        };
+      }
+
+      function readScrapingSettings() {
+        return {
+          scraping_enabled: document.getElementById('scrapingEnabled')?.checked === true
         };
       }
 
@@ -2269,6 +3488,91 @@ HTML_PAGE = """
         }
       }
 
+      function clearScrapingMarkers() {
+        scrapingMarkers.forEach(m => map.removeLayer(m));
+        scrapingMarkers = [];
+      }
+
+      function scrapingMarkerIconHtml(iconType) {
+        const normalized = String(iconType || '').trim().toLowerCase() === 'risk' ? 'risk' : 'info';
+        const symbol = normalized === 'risk' ? '!' : 'i';
+        return `<div class="scraping-marker-icon ${normalized}">${escapeHtml(symbol)}</div>`;
+      }
+
+      function scrapingPopupHtml(point, previewRow) {
+        const locationName = escapeHtml(point?.location_name || 'Unknown location');
+        const iconType = String(point?.icon_type || 'info').trim().toLowerCase() === 'risk' ? 'risk' : 'info';
+        const iconLabel = iconType === 'risk' ? 'Risk signal posts found' : 'Fallback informational posts (no risk hit)';
+        const riskCount = Number(point?.risk_count ?? 0);
+        const fallbackCount = Number(point?.fallback_count ?? 0);
+        const coordSource = escapeHtml(point?.coordinate_source || 'unknown');
+        const sourceLabel = iconType === 'risk' ? 'Risk marker (!)' : 'Info marker (i)';
+
+        let previewHtml = '<div class="muted">No preview post available.</div>';
+        if (previewRow && typeof previewRow === 'object') {
+          const text = String(previewRow?.text || '').trim();
+          const shortText = text.length > 180 ? `${text.slice(0, 177)}...` : text;
+          const tweetUrl = String(previewRow?.tweet_url || '').trim();
+          const created = escapeHtml(previewRow?.created_at || 'n/a');
+          const username = escapeHtml(previewRow?.username || 'unknown');
+          previewHtml = `
+            <div><strong>Sample post:</strong> [${created}] @${username}</div>
+            <div>${escapeHtml(shortText || '(empty text)')}</div>
+            ${tweetUrl ? `<div><a href="${escapeHtml(tweetUrl)}" target="_blank" rel="noopener noreferrer">Open post</a></div>` : ''}
+          `;
+        }
+
+        return `
+          <div class="semantic-popup">
+            <h4>&bull; ${locationName}</h4>
+            <div><strong>Marker:</strong> ${escapeHtml(sourceLabel)}</div>
+            <div><strong>Meaning:</strong> ${escapeHtml(iconLabel)}</div>
+            <div><strong>Risk count:</strong> ${escapeHtml(riskCount)}</div>
+            <div><strong>Fallback count:</strong> ${escapeHtml(fallbackCount)}</div>
+            <div><strong>Coordinate source:</strong> ${coordSource}</div>
+            ${previewHtml}
+          </div>
+        `;
+      }
+
+      function renderScrapingMarkers(data) {
+        clearScrapingMarkers();
+        const scraping = data?.scraping || {};
+        const points = Array.isArray(scraping?.municipality_points) ? scraping.municipality_points : [];
+        if (points.length === 0) {
+          return;
+        }
+
+        const previewRows = Array.isArray(scraping?.preview_rows) ? scraping.preview_rows : [];
+        const previewByLocation = new Map();
+        for (const row of previewRows) {
+          const key = municipalityNameKey(row?.location_name);
+          if (!key || previewByLocation.has(key)) {
+            continue;
+          }
+          previewByLocation.set(key, row);
+        }
+
+        for (const point of points) {
+          if (typeof point?.lat !== 'number' || typeof point?.lng !== 'number') {
+            continue;
+          }
+          const iconType = String(point?.icon_type || 'info').trim().toLowerCase() === 'risk' ? 'risk' : 'info';
+          const previewRow = previewByLocation.get(municipalityNameKey(point?.location_name));
+          const marker = L.marker([point.lat, point.lng], {
+            icon: L.divIcon({
+              className: 'semantic-anchor-shell',
+              html: scrapingMarkerIconHtml(iconType),
+              iconSize: [19, 19],
+              iconAnchor: [9, 9],
+              popupAnchor: [0, -10]
+            })
+          }).addTo(map);
+          marker.bindPopup(scrapingPopupHtml(point, previewRow), { maxWidth: 320 });
+          scrapingMarkers.push(marker);
+        }
+      }
+
       async function fetchOsrmRoadGeometry(stops) {
         if (!Array.isArray(stops) || stops.length < 2) {
           return null;
@@ -2438,6 +3742,7 @@ HTML_PAGE = """
           routeLayers.push(line);
         }));
         renderSemanticAnchors(data);
+        renderScrapingMarkers(data);
         return data;
       }
 
@@ -2560,6 +3865,8 @@ HTML_PAGE = """
         payload.poi_auto_enabled = poiAutoSettings.poi_auto_enabled;
         payload.poi_auto_radius_km = poiAutoSettings.poi_auto_radius_km;
         payload.poi_auto_max_candidates = poiAutoSettings.poi_auto_max_candidates;
+        const scrapingSettings = readScrapingSettings();
+        payload.scraping_enabled = scrapingSettings.scraping_enabled;
         const llmSettings = readMunicipalityLlmSettings();
         payload.municipality_llm_enrichment_enabled = llmSettings.municipality_llm_enrichment_enabled;
         payload.municipality_llm_timeout_sec = llmSettings.municipality_llm_timeout_sec;
@@ -2610,6 +3917,8 @@ HTML_PAGE = """
         payload.poi_auto_enabled = poiAutoSettings.poi_auto_enabled;
         payload.poi_auto_radius_km = poiAutoSettings.poi_auto_radius_km;
         payload.poi_auto_max_candidates = poiAutoSettings.poi_auto_max_candidates;
+        const scrapingSettings = readScrapingSettings();
+        payload.scraping_enabled = scrapingSettings.scraping_enabled;
         const llmSettings = readMunicipalityLlmSettings();
         payload.municipality_llm_enrichment_enabled = llmSettings.municipality_llm_enrichment_enabled;
         payload.municipality_llm_timeout_sec = llmSettings.municipality_llm_timeout_sec;
@@ -2738,6 +4047,15 @@ def _solve(req: func.HttpRequest) -> func.HttpResponse:
                 "Semantic enrichment failed; VRP result remains valid."
             )
     checkpoint("semantic layer completed")
+
+    municipality_names = _collect_route_municipality_names(result)
+    result["scraping"] = _run_social_scraping(
+        payload=semantic_payload,
+        municipality_names=municipality_names,
+        source_stage="solve_vrp",
+        result_payload=result,
+    )
+    checkpoint("scraping completed")
 
     if "_here_prefetch" in semantic_payload:
         result["here_prefetch"] = semantic_payload["_here_prefetch"]
@@ -2987,6 +4305,14 @@ def _enrich_municipality(req: func.HttpRequest) -> func.HttpResponse:
         )
     else:
         result["semantic_layer"] = municipality_semantic
+    municipality_names = _collect_route_municipality_names(result)
+    result["scraping"] = _run_social_scraping(
+        payload=semantic_payload,
+        municipality_names=municipality_names,
+        source_stage="enrich_municipality",
+        result_payload=result,
+    )
+    checkpoint("scraping completed")
 
     checkpoint("response ready")
     return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)

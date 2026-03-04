@@ -13,6 +13,8 @@ This project provides a small Vehicle Routing Problem (VRP) demo:
 - `solve_vrp/semantic_layer.py`: Route semantic enrichment (locations + weather/traffic context)
 - `solve_vrp/here_platform.py`: HERE API integration (weather + traffic real-time and forecast aggregation)
 - `solve_vrp/here_emulator.py`: HERE-like emulator for weather/traffic structures
+- `solve_vrp/social_geo_scraper.py`: Bluesky social scraping client used by the solve pipeline
+- `solve_vrp/twitter_geo_scraper.py`: Backward-compatible CLI scraper wrapper (now Bluesky-based)
 - `host.json`: Function host settings
 - `local.settings.example.json`: Safe template for local runtime settings
 - `requirements.txt`: Dependencies
@@ -83,6 +85,16 @@ Optional request fields for enrichment:
 - `here_traffic_radius_m`: real-time traffic query radius around each segment midpoint
 - `here_forecast_window_hours`: forecast window size (default 24)
 - `here_forecast_interval_min`: sampling interval for forecast slots (default 120)
+- `scraping_enabled`: enable/disable Bluesky scraping (`false` by default)
+- `scraping_keywords`: query text used for social search (supports `x OR y OR z` style query terms)
+- `scraping_locations`: optional explicit municipality/city names to search (if omitted, backend uses municipality names detected from route outputs)
+- `scraping_per_location_limit`: max posts kept per searched municipality (default `5`)
+- `scraping_minutes_back`: lookback window in minutes for recent posts (default `30`)
+- `scraping_pause_seconds`: optional delay between municipality queries to reduce burst rate
+- `scraping_preview_limit`: max rows returned in `scraping.preview_rows` (default `60`)
+- `scraping_fallback_max_posts`: optional fallback cap (max `3`) used when no risk-hit posts are found for a municipality
+- `scraping_stage`: run policy for scraping stage (`enrich_only` default, `both`, or `solve_only`)
+- `scraping_force_refresh`: when `true`, bypass cache reads for the current request
 - `municipality_reverse_source`: reverse geocoder provider, `nominatim_reverse` (default) or `azure_maps_reverse`
 - `municipality_reverse_min_interval_ms`: throttle between reverse-geocode requests (default `1100` for Nominatim, `100` for Azure Maps)
 - `municipality_llm_enrichment_enabled`: enable Azure OpenAI municipality completion over route + segments (default `true` when municipality enrichment is enabled)
@@ -99,6 +111,30 @@ The response `semantic_layer` contains:
 - `routes[].semantic_locations`: ranked near-route locations with distance/detour and relevance
 - `routes[].segment_context`: per-segment ETA, midpoint, matched weather/traffic plus `forecast_24h`
 - `routes[].semantic_locations[].weather|traffic`: location-linked context copied from nearest segment
+
+The solve response also includes `scraping` with:
+
+- searched municipality names
+- per-municipality post counts
+- preview rows for matched posts
+- `generated_at_utc` and `source_stage` (`solve_vrp` or `enrich_municipality`)
+- stage gating diagnostics (`stage_policy`, `stage_allowed`, `stage_skip_reason`)
+- latest output report file path (`social_scraping_latest.txt`)
+- timestamped report snapshot path (`social_scraping_YYYYMMDD_HHMMSS_fff.txt`)
+- cache/network observability (`cache_backend`, `cache_key_version`, `cache_hits`, `cache_misses`, `cache_writes`, `cache_errors`, `network_queries_attempted`, `network_queries_succeeded`, `network_errors`)
+- effective Bluesky endpoint (`bluesky_api_base_effective`)
+- fallback observability (`risk_posts_total`, `fallback_posts_total`, `locations_with_risk`, `locations_with_fallback`, `fallback_mode_used`)
+- map marker payload (`municipality_points`) with municipality-level coordinates and icon type (`risk` or `info`)
+- unresolved icon coordinates list (`unresolved_locations_for_icons`)
+
+Default behavior is `scraping_stage=enrich_only`: solve stage skips scraping, and `enrich_municipality` runs scraping after municipality merge. Set `scraping_stage=both` to run in both stages.
+
+Fallback scraping behavior:
+
+- Step 1: run risk query (`scraping_keywords`) per municipality.
+- Step 2: if risk query returns 0 rows for that municipality, run fallback query with no risk keywords and keep up to `3` latest rows.
+- `preview_rows[].classification` is `risk` or `fallback_info`; `preview_rows[].is_fallback` flags fallback rows.
+- `preview_rows[]` now includes `post_uri` for post traceability.
 
 ### HERE data behavior
 
@@ -118,6 +154,16 @@ For local Azure Functions runs, copy `local.settings.example.json` to `local.set
 {
   "Values": {
     "HERE_API_KEY": "YOUR_HERE_KEY",
+    "BLUESKY_IDENTIFIER": "YOUR_HANDLE_OR_DID",
+    "BLUESKY_APP_PASSWORD": "YOUR_BLUESKY_APP_PASSWORD",
+    "BLUESKY_API_BASE": "https://api.bsky.app",
+    "BLUESKY_TIMEOUT_SEC": "10",
+    "SCRAPING_CACHE_BACKEND": "memory",
+    "SCRAPING_CACHE_REDIS_URL": "rediss://:PASSWORD@YOUR_REDIS_HOST:6380/0",
+    "SCRAPING_CACHE_TTL_SEC": "1800",
+    "SCRAPING_CACHE_GEOHASH_PRECISION": "6",
+    "SCRAPING_FALLBACK_MAX_POSTS": "3",
+    "SCRAPING_CACHE_MAX_ERRORS": "20",
     "MUNICIPALITY_REVERSE_SOURCE": "nominatim_reverse",
     "AZURE_MAPS_SUBSCRIPTION_KEY": "YOUR_AZURE_MAPS_KEY",
     "AZURE_MAPS_REVERSE_ENDPOINT": "https://atlas.microsoft.com/reverseGeocode",
@@ -129,6 +175,15 @@ For local Azure Functions runs, copy `local.settings.example.json` to `local.set
   }
 }
 ```
+
+For Bluesky, use an app password generated in your Bluesky account settings (do not use your main account password).
+If `BLUESKY_API_BASE` is set to `https://public.api.bsky.app`, runtime now auto-remaps to `https://api.bsky.app` and records a diagnostic warning.
+
+Caching recommendation:
+
+- Production: set `SCRAPING_CACHE_BACKEND=redis` and provide `SCRAPING_CACHE_REDIS_URL` (Azure Cache for Redis, `rediss://`).
+- Local/dev: use `SCRAPING_CACHE_BACKEND=memory`.
+- If Redis is unavailable at runtime, scraping automatically degrades to in-process memory cache and records details in `scraping.cache_errors`.
 
 Reverse geocoding supports both providers. Default is Nominatim (`nominatim_reverse`); switch to Azure Maps by setting `MUNICIPALITY_REVERSE_SOURCE=azure_maps_reverse` (and configuring `AZURE_MAPS_SUBSCRIPTION_KEY`).
 
