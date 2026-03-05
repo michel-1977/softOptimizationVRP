@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,13 +29,16 @@ class SocialGeoScraper:
         keywords: str,
         per_location_limit: int = 5,
         minutes_back: int = 30,
+        lang: str = "",
     ) -> List[Dict[str, Any]]:
         query = self._build_query(keywords, location_name)
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(minutes_back)))
+        lang_filter = _normalize_lang_tag(lang)
         posts = self._search_bluesky(
             query=query,
             limit=per_location_limit,
             cutoff=cutoff,
+            lang_filter=lang_filter,
         )
         posts.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
         return posts[: max(1, int(per_location_limit))]
@@ -103,12 +107,16 @@ class SocialGeoScraper:
         return token
 
     def _search_bluesky(
-        self, query: str, limit: int, cutoff: datetime
+        self, query: str, limit: int, cutoff: datetime, lang_filter: str = ""
     ) -> List[Dict[str, Any]]:
         endpoint = f"{self.bluesky_api_base}/xrpc/app.bsky.feed.searchPosts"
-        params = urllib.parse.urlencode(
-            {"q": query, "limit": max(1, min(int(limit), 100))}
-        )
+        params_obj: Dict[str, Any] = {
+            "q": query,
+            "limit": max(1, min(int(limit), 100)),
+        }
+        if lang_filter:
+            params_obj["lang"] = lang_filter
+        params = urllib.parse.urlencode(params_obj)
         url = f"{endpoint}?{params}"
 
         access_token = self._ensure_bluesky_access_token()
@@ -147,13 +155,18 @@ class SocialGeoScraper:
             if not isinstance(item, dict):
                 continue
 
-            created_raw = item.get("record", {}).get("createdAt")
+            record = item.get("record", {}) if isinstance(item.get("record"), dict) else {}
+            post_langs = _extract_post_langs(record)
+            if lang_filter and not _post_matches_lang_filter(post_langs, lang_filter):
+                continue
+
+            created_raw = record.get("createdAt")
             created = _parse_utc_datetime(created_raw)
             if created and created < cutoff:
                 continue
 
             author = item.get("author", {}) if isinstance(item.get("author"), dict) else {}
-            text = item.get("record", {}).get("text", "")
+            text = record.get("text", "")
             uri = str(item.get("uri", "")).strip()
             post_id = _extract_post_id_from_uri(uri)
             handle = str(author.get("handle") or "").strip()
@@ -171,6 +184,7 @@ class SocialGeoScraper:
                     "like_count": _value_to_serializable(item.get("likeCount")),
                     "retweet_count": _value_to_serializable(item.get("repostCount")),
                     "reply_count": _value_to_serializable(item.get("replyCount")),
+                    "post_langs": post_langs,
                     "source_platform": "bluesky",
                 }
             )
@@ -216,6 +230,55 @@ def _extract_post_id_from_uri(uri: str) -> str:
     if len(parts) < 3:
         return ""
     return str(parts[-1]).strip()
+
+
+def _normalize_lang_tag(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[^a-z0-9-]", "", raw)
+    if not cleaned:
+        return ""
+    return cleaned
+
+
+def _extract_post_langs(record: Dict[str, Any]) -> List[str]:
+    langs_raw = record.get("langs")
+    rows: List[str] = []
+    if isinstance(langs_raw, list):
+        for item in langs_raw:
+            lang = _normalize_lang_tag(item)
+            if lang:
+                rows.append(lang)
+    elif isinstance(record.get("lang"), str):
+        lang = _normalize_lang_tag(record.get("lang"))
+        if lang:
+            rows.append(lang)
+
+    deduped: List[str] = []
+    seen = set()
+    for lang in rows:
+        if lang in seen:
+            continue
+        seen.add(lang)
+        deduped.append(lang)
+    return deduped
+
+
+def _lang_matches(post_lang: str, lang_filter: str) -> bool:
+    post_token = _normalize_lang_tag(post_lang)
+    filter_token = _normalize_lang_tag(lang_filter)
+    if not post_token or not filter_token:
+        return False
+    return post_token == filter_token or post_token.startswith(filter_token + "-")
+
+
+def _post_matches_lang_filter(post_langs: List[str], lang_filter: str) -> bool:
+    if not lang_filter:
+        return True
+    if not isinstance(post_langs, list) or not post_langs:
+        return False
+    return any(_lang_matches(lang, lang_filter) for lang in post_langs)
 
 
 def _build_post_url(uri: str, handle: str, did: str) -> str:

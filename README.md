@@ -95,6 +95,11 @@ Optional request fields for enrichment:
 - `scraping_fallback_max_posts`: optional fallback cap (max `3`) used when no risk-hit posts are found for a municipality
 - `scraping_stage`: run policy for scraping stage (`enrich_only` default, `both`, or `solve_only`)
 - `scraping_force_refresh`: when `true`, bypass cache reads for the current request
+- `scraping_cache_miss_debug_limit`: max number of per-miss debug rows included in `scraping.cache_miss_details` (default `120`, max `500`)
+- `scraping_forward_geocode_enabled`: when `true` (default), unresolved municipality icon coordinates can use forward geocoding fallback for locations with posts
+- `scraping_forward_geocode_timeout_sec`: timeout for forward geocode requests (default `4`)
+- `scraping_forward_geocode_limit`: max municipalities per run allowed to use forward-geocode fallback (default `20`)
+- `scraping_lang`: optional Bluesky language filter (for example `es`), applied to both risk and fallback queries
 - `municipality_reverse_source`: reverse geocoder provider, `nominatim_reverse` (default) or `azure_maps_reverse`
 - `municipality_reverse_min_interval_ms`: throttle between reverse-geocode requests (default `1100` for Nominatim, `100` for Azure Maps)
 - `municipality_llm_enrichment_enabled`: enable Azure OpenAI municipality completion over route + segments (default `true` when municipality enrichment is enabled)
@@ -122,7 +127,9 @@ The solve response also includes `scraping` with:
 - latest output report file path (`social_scraping_latest.txt`)
 - timestamped report snapshot path (`social_scraping_YYYYMMDD_HHMMSS_fff.txt`)
 - cache/network observability (`cache_backend`, `cache_key_version`, `cache_hits`, `cache_misses`, `cache_writes`, `cache_errors`, `network_queries_attempted`, `network_queries_succeeded`, `network_errors`)
+- cache miss debugging (`cache_miss_by_reason`, `cache_miss_by_query_type`, `cache_miss_details_count`, `cache_miss_details_truncated`, `cache_miss_details`)
 - effective Bluesky endpoint (`bluesky_api_base_effective`)
+- coordinate/marker diagnostics (`location_resolution`, `locations_with_posts_but_no_icon`, `forward_geocode_attempts`, `forward_geocode_successes`, `forward_geocode_failures`, `forward_geocode_country_codes`, `low_confidence_resolutions_blocked`)
 - fallback observability (`risk_posts_total`, `fallback_posts_total`, `locations_with_risk`, `locations_with_fallback`, `fallback_mode_used`)
 - map marker payload (`municipality_points`) with municipality-level coordinates and icon type (`risk` or `info`)
 - unresolved icon coordinates list (`unresolved_locations_for_icons`)
@@ -133,8 +140,10 @@ Fallback scraping behavior:
 
 - Step 1: run risk query (`scraping_keywords`) per municipality.
 - Step 2: if risk query returns 0 rows for that municipality, run fallback query with no risk keywords and keep up to `3` latest rows.
+- If `scraping_lang` is set (or env `SCRAPING_LANG`), both query calls include that language and rows are strictly filtered by Bluesky `record.langs`.
 - `preview_rows[].classification` is `risk` or `fallback_info`; `preview_rows[].is_fallback` flags fallback rows.
 - `preview_rows[]` now includes `post_uri` for post traceability.
+- Municipality icon coordinates prioritize semantic/address-book evidence first; if unresolved and posts exist, optional forward-geocode fallback is attempted using the configured `municipality_reverse_source`.
 
 ### HERE data behavior
 
@@ -158,16 +167,22 @@ For local Azure Functions runs, copy `local.settings.example.json` to `local.set
     "BLUESKY_APP_PASSWORD": "YOUR_BLUESKY_APP_PASSWORD",
     "BLUESKY_API_BASE": "https://api.bsky.app",
     "BLUESKY_TIMEOUT_SEC": "10",
+    "SCRAPING_LANG": "es",
     "SCRAPING_CACHE_BACKEND": "memory",
     "SCRAPING_CACHE_REDIS_URL": "rediss://:PASSWORD@YOUR_REDIS_HOST:6380/0",
     "SCRAPING_CACHE_TTL_SEC": "1800",
     "SCRAPING_CACHE_GEOHASH_PRECISION": "6",
+    "SCRAPING_FORWARD_GEOCODE_ENABLED": "true",
+    "SCRAPING_FORWARD_GEOCODE_TIMEOUT_SEC": "4",
+    "SCRAPING_FORWARD_GEOCODE_LIMIT": "20",
+    "SCRAPING_FORWARD_GEOCODE_COUNTRY_CODES": "ES",
     "SCRAPING_FALLBACK_MAX_POSTS": "3",
     "SCRAPING_CACHE_MAX_ERRORS": "20",
     "MUNICIPALITY_REVERSE_SOURCE": "nominatim_reverse",
     "AZURE_MAPS_SUBSCRIPTION_KEY": "YOUR_AZURE_MAPS_KEY",
     "AZURE_MAPS_REVERSE_ENDPOINT": "https://atlas.microsoft.com/reverseGeocode",
     "AZURE_MAPS_REVERSE_API_VERSION": "2025-01-01",
+    "AZURE_MAPS_FORWARD_API_VERSION": "1.0",
     "AZURE_OPENAI_ENDPOINT": "https://YOUR_RESOURCE_NAME.openai.azure.com/",
     "AZURE_OPENAI_API_KEY": "YOUR_AZURE_OPENAI_KEY",
     "AZURE_OPENAI_DEPLOYMENT": "YOUR_DEPLOYMENT_NAME",
@@ -186,6 +201,8 @@ Caching recommendation:
 - If Redis is unavailable at runtime, scraping automatically degrades to in-process memory cache and records details in `scraping.cache_errors`.
 
 Reverse geocoding supports both providers. Default is Nominatim (`nominatim_reverse`); switch to Azure Maps by setting `MUNICIPALITY_REVERSE_SOURCE=azure_maps_reverse` (and configuring `AZURE_MAPS_SUBSCRIPTION_KEY`).
+Forward geocoding for social marker coordinates accepts optional country bias via `SCRAPING_FORWARD_GEOCODE_COUNTRY_CODES` (for example `ES`) and, when omitted, infers a country code from route municipality/address data when available.
+For Azure Maps forward geocoding (`/search/address/json`), set `AZURE_MAPS_FORWARD_API_VERSION=1.0` (default).
 
 ### Pipeline modes
 
