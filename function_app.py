@@ -54,16 +54,38 @@ DEFAULT_SCRAPING_KEYWORDS = (
 )
 DEFAULT_SCRAPING_PER_LOCATION_LIMIT = 5
 DEFAULT_SCRAPING_RADIUS_KM = 15
-DEFAULT_SCRAPING_MINUTES_BACK = 30
+DEFAULT_SCRAPING_MINUTES_BACK = 300
 DEFAULT_SCRAPING_PREVIEW_LIMIT = 60
+DEFAULT_SCRAPING_LANG = ""
 DEFAULT_SCRAPING_FALLBACK_MAX_POSTS = 3
 DEFAULT_SCRAPING_CACHE_TTL_SEC = 1800
 DEFAULT_SCRAPING_CACHE_GEOHASH_PRECISION = 6
 DEFAULT_SCRAPING_CACHE_MAX_ERRORS = 20
+DEFAULT_SCRAPING_CACHE_MISS_DEBUG_LIMIT = 120
+DEFAULT_SCRAPING_FORWARD_GEOCODE_ENABLED = True
+DEFAULT_SCRAPING_FORWARD_GEOCODE_TIMEOUT_SEC = 4
+DEFAULT_SCRAPING_FORWARD_GEOCODE_LIMIT = 20
 DEFAULT_SCRAPING_CACHE_BACKEND = "memory"
 DEFAULT_SCRAPING_STAGE_POLICY = "enrich_only"
 DEFAULT_BLUESKY_API_BASE = "https://api.bsky.app"
 SCRAPING_CACHE_KEY_VERSION = "v2"
+FORWARD_GEOCODE_DISAMBIG_VERSION = "nominatim_v2"
+FORWARD_GEOCODE_QUERY_MODES = {"none", "structured_city", "free_text"}
+NOMINATIM_LOCALITY_ADDRESS_TYPES = {
+    "municipality",
+    "city",
+    "town",
+    "village",
+    "hamlet",
+    "locality",
+}
+NOMINATIM_BROAD_ADMIN_ADDRESS_TYPES = {
+    "province",
+    "state",
+    "county",
+    "region",
+    "road",
+}
 _SCRAPING_MEMORY_CACHE = MemoryTTLCache(max_entries=5000)
 
 
@@ -138,6 +160,13 @@ def _normalize_text_key(value: Any) -> str:
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
 
 
+def _normalize_match_key(value: Any) -> str:
+    normalized = _normalize_text_key(value)
+    if not normalized:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", normalized)
+
+
 def _location_slug(value: Any) -> str:
     normalized = _normalize_text_key(value)
     if not normalized:
@@ -163,12 +192,533 @@ def _iter_routes_from_payload(result_payload: dict) -> List[dict]:
     return routes
 
 
+def _iter_routes_by_priority(result_payload: dict) -> List[Tuple[str, dict]]:
+    prioritized: List[Tuple[str, dict]] = []
+    if not isinstance(result_payload, dict):
+        return prioritized
+
+    semantic = result_payload.get("semantic_layer")
+    if isinstance(semantic, dict):
+        semantic_routes = semantic.get("routes")
+        if isinstance(semantic_routes, list):
+            for route in semantic_routes:
+                if isinstance(route, dict):
+                    prioritized.append(("semantic", route))
+
+    root_routes = result_payload.get("routes")
+    if isinstance(root_routes, list):
+        for route in root_routes:
+            if isinstance(route, dict):
+                prioritized.append(("root", route))
+
+    return prioritized
+
+
+def _resolve_municipality_reverse_source(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"azure", "azure_maps", "azure_maps_reverse", "azmaps"}:
+        return "azure_maps_reverse"
+    if raw in {"nominatim", "nominatim_reverse", "osm"}:
+        return "nominatim_reverse"
+    return "nominatim_reverse"
+
+
+def _empty_forward_geocode_diag() -> Dict[str, Any]:
+    return {
+        "forward_geocode_query_mode": "none",
+        "forward_geocode_selected_addresstype": "",
+        "forward_geocode_selected_place_rank": None,
+        "forward_geocode_candidate_count": 0,
+        "forward_geocode_rejected_broad_admin_count": 0,
+    }
+
+
+def _sanitize_forward_geocode_query_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in FORWARD_GEOCODE_QUERY_MODES:
+        return raw
+    return "none"
+
+
+def _extract_forward_geocode_diag(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    diag = _empty_forward_geocode_diag()
+    if not isinstance(row, dict):
+        return diag
+
+    diag["forward_geocode_query_mode"] = _sanitize_forward_geocode_query_mode(
+        row.get("forward_geocode_query_mode")
+    )
+
+    selected_addresstype = str(
+        row.get("forward_geocode_selected_addresstype", "")
+        or row.get("addresstype", "")
+    ).strip().lower()
+    diag["forward_geocode_selected_addresstype"] = selected_addresstype
+
+    selected_place_rank = _safe_int(
+        row.get("forward_geocode_selected_place_rank"), -1
+    )
+    if selected_place_rank < 0:
+        selected_place_rank = _safe_int(row.get("place_rank"), -1)
+    diag["forward_geocode_selected_place_rank"] = (
+        selected_place_rank if selected_place_rank >= 0 else None
+    )
+    diag["forward_geocode_candidate_count"] = max(
+        0,
+        _safe_int(row.get("forward_geocode_candidate_count"), 0),
+    )
+    diag["forward_geocode_rejected_broad_admin_count"] = max(
+        0,
+        _safe_int(row.get("forward_geocode_rejected_broad_admin_count"), 0),
+    )
+    return diag
+
+
+def _iter_forward_geocode_name_variants(location_name: str) -> List[str]:
+    base = " ".join(str(location_name or "").split())
+    if not base:
+        return []
+
+    values: List[str] = []
+    seen = set()
+
+    def _append(value: Any) -> None:
+        text = " ".join(str(value or "").split())
+        token = _normalize_match_key(text)
+        if not token or token in seen:
+            return
+        seen.add(token)
+        values.append(text)
+
+    _append(base)
+    if "/" in base:
+        _append(re.sub(r"\s*/\s*", " / ", base))
+        for part in base.split("/"):
+            _append(part)
+
+    return values
+
+
+def _search_nominatim_forward_candidates(
+    params: Dict[str, Any], timeout_sec: int
+) -> List[Dict[str, Any]]:
+    url = (
+        "https://nominatim.openstreetmap.org/search?"
+        + urllib.parse.urlencode(params)
+    )
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "softOptimizationVRP/municipality-forward-geocoder",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=max(2, int(timeout_sec))) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, list):
+        return []
+    return [row for row in payload if isinstance(row, dict)]
+
+
+def _nominatim_candidate_match_keys(candidate: Dict[str, Any]) -> set:
+    keys = set()
+
+    def _append(value: Any) -> None:
+        token = _normalize_match_key(value)
+        if token:
+            keys.add(token)
+
+    _append(candidate.get("name"))
+    address = candidate.get("address")
+    if isinstance(address, dict):
+        for field in (
+            "municipality",
+            "city",
+            "town",
+            "village",
+            "hamlet",
+            "locality",
+            "suburb",
+            "city_district",
+            "county",
+            "province",
+            "state",
+        ):
+            _append(address.get(field))
+    return keys
+
+
+def _search_nominatim_forward_municipality(
+    location_name: str, timeout_sec: int, country_codes: str = ""
+) -> Optional[Dict[str, Any]]:
+    query = str(location_name or "").strip()
+    if not query:
+        return None
+
+    normalized_country_codes = ",".join(
+        token.strip().lower()
+        for token in str(country_codes or "").split(",")
+        if token.strip()
+    )
+
+    variants = _iter_forward_geocode_name_variants(query)
+    target_match_keys = {
+        _normalize_match_key(value)
+        for value in variants
+        if _normalize_match_key(value)
+    }
+    if not variants:
+        variants = [query]
+        target_match_keys.add(_normalize_match_key(query))
+
+    query_specs: List[Tuple[str, str, Dict[str, Any]]] = []
+    for variant in variants:
+        params = {
+            "city": variant,
+            "format": "jsonv2",
+            "addressdetails": "1",
+            "limit": "5",
+        }
+        if normalized_country_codes:
+            params["countrycodes"] = normalized_country_codes
+        query_specs.append(("structured_city", variant, params))
+    for variant in variants:
+        params = {
+            "q": variant,
+            "format": "jsonv2",
+            "addressdetails": "1",
+            "limit": "8",
+        }
+        if normalized_country_codes:
+            params["countrycodes"] = normalized_country_codes
+        query_specs.append(("free_text", variant, params))
+
+    candidates: List[Dict[str, Any]] = []
+    seen_candidates = set()
+    for query_mode, variant, params in query_specs:
+        rows = _search_nominatim_forward_candidates(params=params, timeout_sec=timeout_sec)
+        for row in rows:
+            dedupe_key = (
+                f"{row.get('osm_type', '')}:{row.get('osm_id', '')}:"
+                f"{_normalize_match_key(row.get('display_name'))}"
+            )
+            if dedupe_key in seen_candidates:
+                continue
+            seen_candidates.add(dedupe_key)
+            candidate = dict(row)
+            candidate["forward_geocode_query_mode"] = query_mode
+            candidate["forward_geocode_query_variant"] = variant
+            candidates.append(candidate)
+
+    diag = _empty_forward_geocode_diag()
+    diag["forward_geocode_candidate_count"] = len(candidates)
+
+    rejected_broad_admin_count = 0
+    ranked_candidates: List[Tuple[Tuple[int, int, int, int, float], Dict[str, Any]]] = []
+    for candidate in candidates:
+        addresstype = str(candidate.get("addresstype", "")).strip().lower()
+        if addresstype in NOMINATIM_BROAD_ADMIN_ADDRESS_TYPES:
+            rejected_broad_admin_count += 1
+            continue
+        if addresstype not in NOMINATIM_LOCALITY_ADDRESS_TYPES:
+            continue
+
+        lat = _safe_float(candidate.get("lat"), None)
+        lng = _safe_float(candidate.get("lon"), None)
+        if lat is None or lng is None:
+            continue
+
+        place_rank = _safe_int(candidate.get("place_rank"), -1)
+        query_mode = _sanitize_forward_geocode_query_mode(
+            candidate.get("forward_geocode_query_mode")
+        )
+        is_locality_type = addresstype in NOMINATIM_LOCALITY_ADDRESS_TYPES
+        candidate_match_keys = _nominatim_candidate_match_keys(candidate)
+        exact_name_match = bool(candidate_match_keys.intersection(target_match_keys))
+        importance = _safe_float(candidate.get("importance"), 0.0) or 0.0
+
+        base_score = 0
+        if query_mode == "structured_city":
+            base_score -= 40
+        if is_locality_type:
+            base_score -= 90
+        else:
+            base_score += 20
+        if exact_name_match:
+            base_score -= 80
+        else:
+            base_score += 60
+        if place_rank >= 0:
+            if 14 <= place_rank <= 18:
+                base_score -= 25
+            elif place_rank <= 12:
+                base_score += 50
+            elif place_rank > 20:
+                base_score += min(place_rank - 20, 20)
+
+        rank_key = (
+            base_score,
+            0 if is_locality_type else 1,
+            0 if exact_name_match else 1,
+            abs(place_rank - 16) if place_rank >= 0 else 99,
+            -float(importance),
+        )
+        ranked_candidates.append((rank_key, candidate))
+
+    diag["forward_geocode_rejected_broad_admin_count"] = rejected_broad_admin_count
+
+    if not ranked_candidates:
+        return {
+            "coordinate_source": "forward_geocode_nominatim",
+            "resolution_reason": "forward_geocode_nominatim_no_locality_match",
+            "coordinate_confidence": "unknown",
+            "provider": "nominatim_reverse",
+            "forward_geocode_disambiguation_version": FORWARD_GEOCODE_DISAMBIG_VERSION,
+            **diag,
+        }
+
+    ranked_candidates.sort(key=lambda item: item[0])
+    selected = ranked_candidates[0][1]
+    lat = _safe_float(selected.get("lat"), None)
+    lng = _safe_float(selected.get("lon"), None)
+    selected_mode = _sanitize_forward_geocode_query_mode(
+        selected.get("forward_geocode_query_mode")
+    )
+    selected_addresstype = str(selected.get("addresstype", "")).strip().lower()
+    selected_place_rank = _safe_int(selected.get("place_rank"), -1)
+
+    return {
+        "lat": round(float(lat), 6),
+        "lng": round(float(lng), 6),
+        "coordinate_source": "forward_geocode_nominatim",
+        "resolution_reason": "forward_geocode_nominatim_disambiguated",
+        "coordinate_confidence": "high",
+        "provider": "nominatim_reverse",
+        "forward_geocode_disambiguation_version": FORWARD_GEOCODE_DISAMBIG_VERSION,
+        "forward_geocode_query_mode": selected_mode,
+        "forward_geocode_selected_addresstype": selected_addresstype,
+        "forward_geocode_selected_place_rank": (
+            selected_place_rank if selected_place_rank >= 0 else None
+        ),
+        "forward_geocode_candidate_count": diag["forward_geocode_candidate_count"],
+        "forward_geocode_rejected_broad_admin_count": rejected_broad_admin_count,
+    }
+
+
+def _search_azure_maps_forward_municipality(
+    location_name: str, timeout_sec: int, country_codes: str = ""
+) -> Optional[Dict[str, Any]]:
+    query = str(location_name or "").strip()
+    if not query:
+        return None
+
+    azure_key = str(os.getenv("AZURE_MAPS_SUBSCRIPTION_KEY", "")).strip()
+    if not azure_key:
+        raise RuntimeError("AZURE_MAPS_SUBSCRIPTION_KEY is not configured.")
+
+    endpoint_raw = str(
+        os.getenv("AZURE_MAPS_REVERSE_ENDPOINT", "https://atlas.microsoft.com/reverseGeocode")
+    ).strip()
+    if endpoint_raw.endswith("/reverseGeocode"):
+        endpoint = endpoint_raw[: -len("/reverseGeocode")] + "/search/address/json"
+    else:
+        endpoint = endpoint_raw
+    endpoint = endpoint.rstrip("/")
+    if not endpoint.endswith("/search/address/json"):
+        endpoint = endpoint + "/search/address/json"
+    endpoint_lower = endpoint.lower()
+
+    # Azure Maps /search/address/json uses 1.0; newer 2025-* versions apply to /geocode.
+    forward_api_version = str(
+        os.getenv("AZURE_MAPS_FORWARD_API_VERSION", "")
+    ).strip()
+    if forward_api_version:
+        api_version = forward_api_version
+    else:
+        configured_reverse_version = str(
+            os.getenv("AZURE_MAPS_REVERSE_API_VERSION", "2025-01-01")
+        ).strip()
+        if "/search/address/json" in endpoint_lower:
+            api_version = "1.0"
+        else:
+            api_version = configured_reverse_version or "1.0"
+
+    params = {
+        "api-version": api_version,
+        "subscription-key": azure_key,
+        "query": query,
+        "limit": "1",
+    }
+    normalized_country_codes = ",".join(
+        token.strip().upper()
+        for token in str(country_codes or "").split(",")
+        if token.strip()
+    )
+    if normalized_country_codes:
+        params["countrySet"] = normalized_country_codes
+    url = endpoint + "?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "softOptimizationVRP/municipality-forward-geocoder",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=max(2, int(timeout_sec))) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if not isinstance(payload, dict):
+        return None
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+    first = results[0]
+    if not isinstance(first, dict):
+        return None
+    position = first.get("position")
+    if not isinstance(position, dict):
+        return None
+    lat = _safe_float(position.get("lat"), None)
+    lng = _safe_float(position.get("lon"), None)
+    if lat is None or lng is None:
+        return None
+    return {
+        "lat": round(float(lat), 6),
+        "lng": round(float(lng), 6),
+        "coordinate_source": "forward_geocode_azure_maps",
+        "resolution_reason": "forward_geocode_azure_maps",
+        "coordinate_confidence": "high",
+        "provider": "azure_maps_reverse",
+        "forward_geocode_disambiguation_version": FORWARD_GEOCODE_DISAMBIG_VERSION,
+        "forward_geocode_query_mode": "none",
+        "forward_geocode_selected_addresstype": "",
+        "forward_geocode_selected_place_rank": None,
+        "forward_geocode_candidate_count": len(results),
+        "forward_geocode_rejected_broad_admin_count": 0,
+    }
+
+
+def _forward_geocode_municipality(
+    location_name: str,
+    reverse_source: str,
+    timeout_sec: int,
+    country_codes: str = "",
+) -> Optional[Dict[str, Any]]:
+    provider = _resolve_municipality_reverse_source(reverse_source)
+    if provider == "azure_maps_reverse":
+        return _search_azure_maps_forward_municipality(
+            location_name=location_name,
+            timeout_sec=timeout_sec,
+            country_codes=country_codes,
+        )
+    return _search_nominatim_forward_municipality(
+        location_name=location_name,
+        timeout_sec=timeout_sec,
+        country_codes=country_codes,
+    )
+
+
+def _infer_forward_geocode_country_codes(result_payload: Optional[dict]) -> str:
+    counts: Dict[str, int] = {}
+
+    def _add_country(value: Any) -> None:
+        token = str(value or "").strip().upper()
+        if len(token) != 2:
+            return
+        counts[token] = counts.get(token, 0) + 1
+
+    if isinstance(result_payload, dict):
+        semantic = result_payload.get("semantic_layer")
+        if isinstance(semantic, dict):
+            address_book = semantic.get("municipality_address_book")
+            if isinstance(address_book, dict):
+                for row in address_book.values():
+                    if not isinstance(row, dict):
+                        continue
+                    address = row.get("address")
+                    if isinstance(address, dict):
+                        _add_country(address.get("country_code"))
+                    _add_country(row.get("country_code"))
+
+        for route in _iter_routes_from_payload(result_payload):
+            links = route.get("stop_municipality_links")
+            if not isinstance(links, list):
+                continue
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                _add_country(link.get("country_code"))
+
+    if not counts:
+        return ""
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return ranked[0][0]
+
+
+def _coordinate_confidence_from_source(coordinate_source: Any) -> str:
+    source = str(coordinate_source or "").strip().lower()
+    if source in {
+        "address_book",
+        "segment_trace_municipality",
+        "forward_geocode_nominatim",
+        "forward_geocode_azure_maps",
+    }:
+        return "high"
+    if source == "segment_trace_query_point":
+        return "medium"
+    if source.startswith("segment_midpoint"):
+        return "low"
+    return "unknown"
+
+
+def _resolve_coordinate_confidence(coord: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(coord, dict):
+        return "unknown"
+    explicit = str(coord.get("coordinate_confidence", "")).strip().lower()
+    if explicit in {"high", "medium", "low", "unknown"}:
+        return explicit
+    return _coordinate_confidence_from_source(coord.get("coordinate_source"))
+
+
 def _resolve_municipality_coordinate(
     result_payload: dict, location_name: str
 ) -> Optional[Dict[str, Any]]:
     target_key = _normalize_text_key(location_name)
     if not target_key or not isinstance(result_payload, dict):
         return None
+
+    candidates: List[Tuple[int, Dict[str, Any]]] = []
+
+    def _append_candidate(
+        *,
+        score: int,
+        lat: Any,
+        lng: Any,
+        coordinate_source: str,
+        resolution_reason: str,
+        coordinate_confidence: str,
+    ) -> None:
+        safe_lat = _safe_float(lat, None)
+        safe_lng = _safe_float(lng, None)
+        if safe_lat is None or safe_lng is None:
+            return
+        candidates.append(
+            (
+                int(score),
+                {
+                    "lat": round(float(safe_lat), 6),
+                    "lng": round(float(safe_lng), 6),
+                    "coordinate_source": coordinate_source,
+                    "resolution_reason": resolution_reason,
+                    "coordinate_confidence": (
+                        str(coordinate_confidence or "unknown").strip().lower()
+                        or "unknown"
+                    ),
+                },
+            )
+        )
 
     semantic = result_payload.get("semantic_layer")
     if isinstance(semantic, dict):
@@ -180,18 +730,17 @@ def _resolve_municipality_coordinate(
                 row_name = row.get("municipality_name")
                 if _normalize_text_key(row_name) != target_key:
                     continue
-                lat = _safe_float(row.get("lat"), None)
-                lng = _safe_float(row.get("lng"), None)
-                if lat is None or lng is None:
-                    continue
-                return {
-                    "lat": round(float(lat), 6),
-                    "lng": round(float(lng), 6),
-                    "coordinate_source": "address_book",
-                }
+                _append_candidate(
+                    score=10,
+                    lat=row.get("lat"),
+                    lng=row.get("lng"),
+                    coordinate_source="address_book",
+                    resolution_reason="address_book_exact_name",
+                    coordinate_confidence="high",
+                )
 
-    routes = _iter_routes_from_payload(result_payload)
-    for route in routes:
+    prioritized_routes = _iter_routes_by_priority(result_payload)
+    for route_source, route in prioritized_routes:
         segments = route.get("segment_context")
         if not isinstance(segments, list):
             continue
@@ -199,52 +748,82 @@ def _resolve_municipality_coordinate(
             if not isinstance(segment, dict):
                 continue
             municipality_trace = segment.get("municipality_trace")
-            if not isinstance(municipality_trace, list):
-                continue
-            for trace_item in municipality_trace:
-                if not isinstance(trace_item, dict):
-                    continue
-                municipality_obj = (
-                    trace_item.get("municipality")
-                    if isinstance(trace_item.get("municipality"), dict)
-                    else {}
-                )
-                candidate_name = (
-                    municipality_obj.get("name")
-                    or trace_item.get("municipality_name")
-                    or trace_item.get("name")
-                )
-                if _normalize_text_key(candidate_name) != target_key:
-                    continue
-                lat = _safe_float(municipality_obj.get("lat"), None)
-                lng = _safe_float(municipality_obj.get("lng"), None)
-                if lat is None or lng is None:
+            if isinstance(municipality_trace, list):
+                for trace_item in municipality_trace:
+                    if not isinstance(trace_item, dict):
+                        continue
+                    municipality_obj = (
+                        trace_item.get("municipality")
+                        if isinstance(trace_item.get("municipality"), dict)
+                        else {}
+                    )
+                    candidate_name = (
+                        municipality_obj.get("name")
+                        or trace_item.get("municipality_name")
+                        or trace_item.get("name")
+                    )
+                    if _normalize_text_key(candidate_name) != target_key:
+                        continue
+                    source_boost = 0 if route_source == "semantic" else 1
+                    _append_candidate(
+                        score=20 + source_boost,
+                        lat=municipality_obj.get("lat"),
+                        lng=municipality_obj.get("lng"),
+                        coordinate_source="segment_trace_municipality",
+                        resolution_reason=(
+                            f"{route_source}_segment_trace_municipality_exact_name"
+                        ),
+                        coordinate_confidence="high",
+                    )
                     query_point = (
                         trace_item.get("query_point")
                         if isinstance(trace_item.get("query_point"), dict)
                         else {}
                     )
-                    lat = _safe_float(query_point.get("lat"), None)
-                    lng = _safe_float(query_point.get("lng"), None)
-                if lat is None or lng is None:
-                    continue
-                return {
-                    "lat": round(float(lat), 6),
-                    "lng": round(float(lng), 6),
-                    "coordinate_source": "segment_trace",
-                }
+                    _append_candidate(
+                        score=30 + source_boost,
+                        lat=query_point.get("lat"),
+                        lng=query_point.get("lng"),
+                        coordinate_source="segment_trace_query_point",
+                        resolution_reason=(
+                            f"{route_source}_segment_trace_query_point_exact_name"
+                        ),
+                        coordinate_confidence="medium",
+                    )
 
-    for route in routes:
-        segments = route.get("segment_context")
-        if not isinstance(segments, list):
-            continue
+            segment_names = (
+                segment.get("municipality_names")
+                if isinstance(segment.get("municipality_names"), list)
+                else []
+            )
+            normalized_segment_names = {
+                _normalize_text_key(name)
+                for name in segment_names
+                if _normalize_text_key(name)
+            }
+            # Midpoint is only trusted when a segment is unambiguous for one municipality.
+            if target_key in normalized_segment_names and len(normalized_segment_names) == 1:
+                midpoint = segment.get("midpoint")
+                midpoint = midpoint if isinstance(midpoint, dict) else {}
+                source_boost = 0 if route_source == "semantic" else 1
+                _append_candidate(
+                    score=40 + source_boost,
+                    lat=midpoint.get("lat"),
+                    lng=midpoint.get("lng"),
+                    coordinate_source="segment_midpoint_municipality_name",
+                    resolution_reason=(
+                        f"{route_source}_segment_midpoint_municipality_names_exact_name"
+                    ),
+                    coordinate_confidence="low",
+                )
+
         segment_by_index: Dict[int, dict] = {}
         for segment in segments:
             if not isinstance(segment, dict):
                 continue
-            segment_index = segment.get("segment_index")
-            if isinstance(segment_index, int):
-                segment_by_index[segment_index] = segment
+            s_index = segment.get("segment_index")
+            if isinstance(s_index, int):
+                segment_by_index[s_index] = segment
 
         municipality_llm = (
             route.get("municipality_llm")
@@ -261,26 +840,29 @@ def _resolve_municipality_coordinate(
                 continue
             if _normalize_text_key(row.get("name")) != target_key:
                 continue
-            segment_index = row.get("segment_index")
-            if not isinstance(segment_index, int):
+            llm_segment_index = row.get("segment_index")
+            if not isinstance(llm_segment_index, int):
                 continue
-            segment = segment_by_index.get(segment_index)
+            segment = segment_by_index.get(llm_segment_index)
             midpoint = (
                 segment.get("midpoint")
                 if isinstance(segment, dict) and isinstance(segment.get("midpoint"), dict)
                 else {}
             )
-            lat = _safe_float(midpoint.get("lat"), None)
-            lng = _safe_float(midpoint.get("lng"), None)
-            if lat is None or lng is None:
-                continue
-            return {
-                "lat": round(float(lat), 6),
-                "lng": round(float(lng), 6),
-                "coordinate_source": "segment_midpoint",
-            }
+            source_boost = 0 if route_source == "semantic" else 1
+            _append_candidate(
+                score=50 + source_boost,
+                lat=midpoint.get("lat"),
+                lng=midpoint.get("lng"),
+                coordinate_source="segment_midpoint_llm_added",
+                resolution_reason=f"{route_source}_llm_added_segment_midpoint_exact_name",
+                coordinate_confidence="low",
+            )
 
-    return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def _parse_scraping_cache_backend(value: Any) -> str:
@@ -352,18 +934,29 @@ def _build_scraping_cache_key(
     minutes_back: int,
     limit: int,
     api_base: str,
+    lang_filter: str = "",
+    extra_namespace: str = "",
 ) -> str:
     keywords_hash = hashlib.sha1(
         str(keywords or "").strip().casefold().encode("utf-8")
     ).hexdigest()[:12]
+    lang_hash = hashlib.sha1(
+        str(lang_filter or "").strip().casefold().encode("utf-8")
+    ).hexdigest()[:8]
     base_hash = hashlib.sha1(
         str(api_base or "").strip().casefold().encode("utf-8")
     ).hexdigest()[:8]
+    extra_hash = hashlib.sha1(
+        str(extra_namespace or "").strip().casefold().encode("utf-8")
+    ).hexdigest()[:8]
     loc_token = str(geohash_or_loc or "unknown").strip().lower() or "unknown"
-    return (
+    key = (
         f"scrape:{SCRAPING_CACHE_KEY_VERSION}:{query_type}:{base_hash}:{loc_token}:"
-        f"{keywords_hash}:{int(minutes_back)}:{int(limit)}"
+        f"{keywords_hash}:{lang_hash}:{int(minutes_back)}:{int(limit)}"
     )
+    if str(extra_namespace or "").strip():
+        key = f"{key}:{extra_hash}"
+    return key
 
 
 def _encode_geohash(lat: Optional[float], lng: Optional[float], precision: int) -> str:
@@ -508,6 +1101,7 @@ def _build_scraping_report_text(meta: dict) -> str:
     lines.append(f"status: {meta.get('status', 'unknown')}")
     lines.append(f"message: {meta.get('message', '')}")
     lines.append(f"keywords: {meta.get('keywords', '')}")
+    lines.append(f"scraping_lang: {meta.get('scraping_lang', '')}")
     lines.append(f"locations_requested: {meta.get('locations_requested', 0)}")
 
     requested_keys = meta.get("locations_requested_keys", [])
@@ -537,6 +1131,39 @@ def _build_scraping_report_text(meta: dict) -> str:
     lines.append(f"cache_writes: {meta.get('cache_writes', 0)}")
     lines.append(f"network_queries_attempted: {meta.get('network_queries_attempted', 0)}")
     lines.append(f"network_queries_succeeded: {meta.get('network_queries_succeeded', 0)}")
+    lines.append(f"forward_geocode_attempts: {meta.get('forward_geocode_attempts', 0)}")
+    lines.append(f"forward_geocode_successes: {meta.get('forward_geocode_successes', 0)}")
+    lines.append(f"forward_geocode_failures: {meta.get('forward_geocode_failures', 0)}")
+    lines.append(
+        "forward_geocode_disambiguation_version: "
+        f"{meta.get('forward_geocode_disambiguation_version', FORWARD_GEOCODE_DISAMBIG_VERSION)}"
+    )
+    lines.append(
+        f"forward_geocode_bad_admin_rejections: {meta.get('forward_geocode_bad_admin_rejections', 0)}"
+    )
+    query_modes_used = meta.get("forward_geocode_query_modes_used", [])
+    if isinstance(query_modes_used, list) and query_modes_used:
+        lines.append(
+            "forward_geocode_query_modes_used: "
+            + ", ".join(str(mode) for mode in query_modes_used)
+        )
+    else:
+        lines.append("forward_geocode_query_modes_used: none")
+    lines.append(
+        f"forward_geocode_country_codes: {meta.get('forward_geocode_country_codes', '')}"
+    )
+    lines.append(
+        f"low_confidence_resolutions_blocked: {meta.get('low_confidence_resolutions_blocked', 0)}"
+    )
+    lines.append(
+        f"cache_miss_debug_limit: {meta.get('cache_miss_debug_limit', DEFAULT_SCRAPING_CACHE_MISS_DEBUG_LIMIT)}"
+    )
+    lines.append(
+        f"cache_miss_details_count: {meta.get('cache_miss_details_count', 0)}"
+    )
+    lines.append(
+        f"cache_miss_details_truncated: {meta.get('cache_miss_details_truncated', 0)}"
+    )
     network_errors = meta.get("network_errors", [])
     if isinstance(network_errors, list) and network_errors:
         lines.append("network_errors:")
@@ -544,6 +1171,94 @@ def _build_scraping_report_text(meta: dict) -> str:
             lines.append(f"- {err}")
     else:
         lines.append("network_errors: none")
+
+    miss_by_reason = meta.get("cache_miss_by_reason", {})
+    if isinstance(miss_by_reason, dict) and miss_by_reason:
+        lines.append("cache_miss_by_reason:")
+        for reason, count in miss_by_reason.items():
+            lines.append(f"- {reason}: {count}")
+    else:
+        lines.append("cache_miss_by_reason: none")
+
+    miss_by_query = meta.get("cache_miss_by_query_type", {})
+    if isinstance(miss_by_query, dict) and miss_by_query:
+        lines.append("cache_miss_by_query_type:")
+        for query_type, count in miss_by_query.items():
+            lines.append(f"- {query_type}: {count}")
+    else:
+        lines.append("cache_miss_by_query_type: none")
+
+    cache_miss_details = meta.get("cache_miss_details", [])
+    if isinstance(cache_miss_details, list) and cache_miss_details:
+        lines.append("cache_miss_details:")
+        for row in cache_miss_details:
+            if not isinstance(row, dict):
+                continue
+            location_name = str(row.get("location_name", "")).strip()
+            query_type = str(row.get("query_type", "")).strip()
+            reason = str(row.get("reason", "")).strip()
+            cache_key = str(row.get("cache_key", "")).strip()
+            lines.append(
+                f"- {location_name} [{query_type}] reason={reason} cache_key={cache_key}"
+            )
+        truncated = _safe_int(meta.get("cache_miss_details_truncated"), 0)
+        if truncated > 0:
+            lines.append(f"- ... {truncated} additional miss rows were truncated")
+    else:
+        lines.append("cache_miss_details: none")
+
+    locations_without_icon = meta.get("locations_with_posts_but_no_icon", [])
+    if isinstance(locations_without_icon, list) and locations_without_icon:
+        lines.append("locations_with_posts_but_no_icon:")
+        for name in locations_without_icon:
+            lines.append(f"- {name}")
+    else:
+        lines.append("locations_with_posts_but_no_icon: none")
+
+    location_resolution = meta.get("location_resolution", [])
+    if isinstance(location_resolution, list) and location_resolution:
+        lines.append("location_resolution:")
+        for row in location_resolution:
+            if not isinstance(row, dict):
+                continue
+            location_name = str(row.get("location_name", "")).strip()
+            posts_count = _safe_int(row.get("posts_count"), 0)
+            resolved = bool(row.get("resolved"))
+            lat = row.get("lat")
+            lng = row.get("lng")
+            source = str(row.get("coordinate_source", "")).strip()
+            reason = str(row.get("resolution_reason", "")).strip()
+            confidence = str(row.get("coordinate_confidence", "")).strip()
+            override_attempted = bool(row.get("override_attempted"))
+            override_result = str(row.get("override_result", "")).strip()
+            forward_query_mode = str(
+                row.get("forward_geocode_query_mode", "none")
+            ).strip()
+            forward_selected_addresstype = str(
+                row.get("forward_geocode_selected_addresstype", "")
+            ).strip()
+            forward_selected_place_rank = row.get(
+                "forward_geocode_selected_place_rank"
+            )
+            forward_candidate_count = _safe_int(
+                row.get("forward_geocode_candidate_count"), 0
+            )
+            forward_rejected_admin = _safe_int(
+                row.get("forward_geocode_rejected_broad_admin_count"), 0
+            )
+            lines.append(
+                f"- {location_name}: posts={posts_count} resolved={resolved} "
+                f"lat={lat} lng={lng} source={source} reason={reason} "
+                f"confidence={confidence} override_attempted={override_attempted} "
+                f"override_result={override_result} "
+                f"forward_mode={forward_query_mode} "
+                f"forward_addresstype={forward_selected_addresstype} "
+                f"forward_place_rank={forward_selected_place_rank} "
+                f"forward_candidates={forward_candidate_count} "
+                f"forward_rejected_admin={forward_rejected_admin}"
+            )
+    else:
+        lines.append("location_resolution: none")
     lines.append("")
     lines.append("results_by_location:")
 
@@ -606,6 +1321,15 @@ def _run_social_scraping(
         if requested_locations_explicit
         else municipality_locations
     )
+    scraping_lang = str(
+        payload.get(
+            "scraping_lang",
+            os.getenv("SCRAPING_LANG", DEFAULT_SCRAPING_LANG),
+        )
+    ).strip().lower().replace("_", "-")
+    if "," in scraping_lang:
+        scraping_lang = scraping_lang.split(",", 1)[0].strip()
+    scraping_lang = re.sub(r"[^a-z0-9-]", "", scraping_lang)
 
     max_cache_errors = max(
         1,
@@ -613,10 +1337,74 @@ def _run_social_scraping(
             os.getenv("SCRAPING_CACHE_MAX_ERRORS"), DEFAULT_SCRAPING_CACHE_MAX_ERRORS
         ),
     )
+    forward_geocode_enabled = _as_bool(
+        payload.get("scraping_forward_geocode_enabled"),
+        _as_bool(
+            os.getenv("SCRAPING_FORWARD_GEOCODE_ENABLED"),
+            DEFAULT_SCRAPING_FORWARD_GEOCODE_ENABLED,
+        ),
+    )
+    forward_geocode_timeout_sec = max(
+        2,
+        _safe_int(
+            payload.get("scraping_forward_geocode_timeout_sec"),
+            _safe_int(
+                os.getenv("SCRAPING_FORWARD_GEOCODE_TIMEOUT_SEC"),
+                DEFAULT_SCRAPING_FORWARD_GEOCODE_TIMEOUT_SEC,
+            ),
+        ),
+    )
+    forward_geocode_limit = max(
+        0,
+        min(
+            _safe_int(
+                payload.get("scraping_forward_geocode_limit"),
+                _safe_int(
+                    os.getenv("SCRAPING_FORWARD_GEOCODE_LIMIT"),
+                    DEFAULT_SCRAPING_FORWARD_GEOCODE_LIMIT,
+                ),
+            ),
+            200,
+        ),
+    )
+    forward_geocode_country_codes = str(
+        payload.get(
+            "scraping_forward_geocode_country_codes",
+            os.getenv("SCRAPING_FORWARD_GEOCODE_COUNTRY_CODES", ""),
+        )
+    ).strip()
+    if not forward_geocode_country_codes:
+        forward_geocode_country_codes = _infer_forward_geocode_country_codes(result_payload)
+    cache_miss_debug_limit = max(
+        0,
+        min(
+            _safe_int(
+                payload.get("scraping_cache_miss_debug_limit"),
+                _safe_int(
+                    os.getenv("SCRAPING_CACHE_MISS_DEBUG_LIMIT"),
+                    DEFAULT_SCRAPING_CACHE_MISS_DEBUG_LIMIT,
+                ),
+            ),
+            500,
+        ),
+    )
 
     cache_errors: List[str] = []
     network_errors: List[str] = []
+    cache_miss_details: List[dict] = []
+    cache_miss_by_reason: Dict[str, int] = {}
+    cache_miss_by_query_type: Dict[str, int] = {}
+    cache_miss_details_truncated = 0
+    cache_miss_total = 0
     cache_backend: str = "none"
+    location_resolution: List[dict] = []
+    locations_with_posts_but_no_icon: List[str] = []
+    forward_geocode_attempts = 0
+    forward_geocode_successes = 0
+    forward_geocode_failures = 0
+    forward_geocode_bad_admin_rejections = 0
+    forward_geocode_query_modes_used = set()
+    low_confidence_resolutions_blocked = 0
 
     meta = {
         "enabled": enabled,
@@ -628,6 +1416,7 @@ def _run_social_scraping(
         "status": "disabled",
         "message": "Social scraping disabled.",
         "keywords": "",
+        "scraping_lang": scraping_lang,
         "locations_requested": len(requested_location_names),
         "locations_requested_keys": list(requested_location_names),
         "locations_requested_names": list(requested_location_names),
@@ -643,6 +1432,25 @@ def _run_social_scraping(
         "cache_misses": 0,
         "cache_writes": 0,
         "cache_errors": cache_errors,
+        "cache_miss_debug_limit": cache_miss_debug_limit,
+        "cache_miss_details": cache_miss_details,
+        "cache_miss_details_count": 0,
+        "cache_miss_details_truncated": 0,
+        "cache_miss_by_reason": cache_miss_by_reason,
+        "cache_miss_by_query_type": cache_miss_by_query_type,
+        "location_resolution": location_resolution,
+        "locations_with_posts_but_no_icon": locations_with_posts_but_no_icon,
+        "forward_geocode_enabled": forward_geocode_enabled,
+        "forward_geocode_timeout_sec": forward_geocode_timeout_sec,
+        "forward_geocode_limit": forward_geocode_limit,
+        "forward_geocode_country_codes": forward_geocode_country_codes,
+        "forward_geocode_disambiguation_version": FORWARD_GEOCODE_DISAMBIG_VERSION,
+        "forward_geocode_attempts": 0,
+        "forward_geocode_successes": 0,
+        "forward_geocode_failures": 0,
+        "forward_geocode_bad_admin_rejections": 0,
+        "forward_geocode_query_modes_used": [],
+        "low_confidence_resolutions_blocked": 0,
         "network_queries_attempted": 0,
         "network_queries_succeeded": 0,
         "network_errors": network_errors,
@@ -814,36 +1622,85 @@ def _run_social_scraping(
         post_uri = str(row.get("post_uri", "")).strip()
         if post_uri and not post_uri.startswith("at://"):
             return False
+        post_langs = row.get("post_langs")
+        if post_langs is not None:
+            if not isinstance(post_langs, list):
+                return False
+            for item in post_langs:
+                if not isinstance(item, str):
+                    return False
         return True
+
+    def _record_cache_miss(
+        *,
+        location_name: str,
+        query_type: str,
+        cache_key: str,
+        reason: str,
+    ) -> None:
+        nonlocal cache_miss_details_truncated, cache_miss_total
+        reason_token = str(reason or "unknown").strip() or "unknown"
+        query_token = str(query_type or "unknown").strip() or "unknown"
+        cache_miss_total += 1
+        cache_miss_by_reason[reason_token] = cache_miss_by_reason.get(reason_token, 0) + 1
+        cache_miss_by_query_type[query_token] = (
+            cache_miss_by_query_type.get(query_token, 0) + 1
+        )
+        if len(cache_miss_details) >= cache_miss_debug_limit:
+            cache_miss_details_truncated += 1
+            return
+        cache_miss_details.append(
+            {
+                "location_name": str(location_name or ""),
+                "query_type": query_token,
+                "reason": reason_token,
+                "cache_key": str(cache_key or ""),
+            }
+        )
 
     def _extract_cached_rows(
         payload_row: dict, expected_query_type: str, max_rows: int
-    ) -> Optional[List[dict]]:
+    ) -> Tuple[Optional[List[dict]], str]:
         if not isinstance(payload_row, dict):
-            return None
+            return None, "cache_payload_not_dict"
         if str(payload_row.get("version", "")).strip() != SCRAPING_CACHE_KEY_VERSION:
-            return None
+            return None, "version_mismatch"
         if str(payload_row.get("query_type", "")).strip().lower() != expected_query_type:
-            return None
+            return None, "query_type_mismatch"
         rows = payload_row.get("rows")
         if not isinstance(rows, list):
-            return None
+            return None, "rows_missing_or_invalid"
         normalized_rows: List[dict] = []
         for row in rows:
             if not isinstance(row, dict):
-                return None
+                return None, "row_not_dict"
             if not _is_valid_cached_row(row):
-                return None
+                return None, "row_schema_invalid"
             normalized_rows.append(row)
-        return normalized_rows[:max_rows]
+        return normalized_rows[:max_rows], ""
 
     def _cache_get_rows(
-        key: str, expected_query_type: str, max_rows: int
+        key: str,
+        expected_query_type: str,
+        max_rows: int,
+        location_name: str,
     ) -> Optional[List[dict]]:
         nonlocal cache_hits, cache_misses, active_cache
         if force_refresh:
+            _record_cache_miss(
+                location_name=location_name,
+                query_type=expected_query_type,
+                cache_key=key,
+                reason="force_refresh_bypass",
+            )
             return None
         if active_cache is None:
+            _record_cache_miss(
+                location_name=location_name,
+                query_type=expected_query_type,
+                cache_key=key,
+                reason="cache_backend_none",
+            )
             return None
         try:
             payload_row = active_cache.get(key)
@@ -858,17 +1715,45 @@ def _run_social_scraping(
                         f"Memory cache get failed: {fallback_exc}",
                         max_errors=max_cache_errors,
                     )
+                    _record_cache_miss(
+                        location_name=location_name,
+                        query_type=expected_query_type,
+                        cache_key=key,
+                        reason="cache_get_error",
+                    )
                     return None
             else:
+                _record_cache_miss(
+                    location_name=location_name,
+                    query_type=expected_query_type,
+                    cache_key=key,
+                    reason="cache_get_error",
+                )
                 return None
 
-        cached_rows = _extract_cached_rows(
-            payload_row=payload_row if isinstance(payload_row, dict) else {},
+        if not isinstance(payload_row, dict):
+            cache_misses += 1
+            _record_cache_miss(
+                location_name=location_name,
+                query_type=expected_query_type,
+                cache_key=key,
+                reason="not_found",
+            )
+            return None
+
+        cached_rows, miss_reason = _extract_cached_rows(
+            payload_row=payload_row,
             expected_query_type=expected_query_type,
             max_rows=max_rows,
         )
         if cached_rows is None:
             cache_misses += 1
+            _record_cache_miss(
+                location_name=location_name,
+                query_type=expected_query_type,
+                cache_key=key,
+                reason=miss_reason or "cache_payload_invalid",
+            )
             return None
         cache_hits += 1
         return cached_rows
@@ -995,12 +1880,14 @@ def _run_social_scraping(
                 minutes_back=minutes_back,
                 limit=per_location_limit,
                 api_base=bluesky_api_base,
+                lang_filter=scraping_lang,
             )
             risk_rows: List[dict] = []
             cached_risk_rows = _cache_get_rows(
                 key=risk_key,
                 expected_query_type="risk",
                 max_rows=per_location_limit,
+                location_name=location_name,
             )
             if cached_risk_rows is not None:
                 risk_rows = cached_risk_rows
@@ -1012,6 +1899,7 @@ def _run_social_scraping(
                         keywords=keywords,
                         per_location_limit=per_location_limit,
                         minutes_back=minutes_back,
+                        lang=scraping_lang,
                     )
                     network_queries_succeeded += 1
                 except Exception as exc:  # noqa: BLE001 - non-blocking per location
@@ -1047,11 +1935,13 @@ def _run_social_scraping(
                     minutes_back=minutes_back,
                     limit=fallback_max_posts,
                     api_base=bluesky_api_base,
+                    lang_filter=scraping_lang,
                 )
                 cached_fallback_rows = _cache_get_rows(
                     key=fallback_key,
                     expected_query_type="fallback",
                     max_rows=fallback_max_posts,
+                    location_name=location_name,
                 )
                 if cached_fallback_rows is not None:
                     fallback_rows = cached_fallback_rows
@@ -1063,6 +1953,7 @@ def _run_social_scraping(
                             keywords="",
                             per_location_limit=fallback_max_posts,
                             minutes_back=minutes_back,
+                            lang=scraping_lang,
                         )
                         network_queries_succeeded += 1
                     except Exception as exc:  # noqa: BLE001 - non-blocking per location
@@ -1132,21 +2023,242 @@ def _run_social_scraping(
                 )
 
             if combined_count > 0:
-                lat = (
-                    _safe_float(location_coord.get("lat"), None)
+                resolved_coord = (
+                    dict(location_coord)
                     if isinstance(location_coord, dict)
                     else None
                 )
-                lng = (
-                    _safe_float(location_coord.get("lng"), None)
-                    if isinstance(location_coord, dict)
+                forward_diag = _extract_forward_geocode_diag(resolved_coord)
+                lat = (
+                    _safe_float(resolved_coord.get("lat"), None)
+                    if isinstance(resolved_coord, dict)
                     else None
+                )
+                lng = (
+                    _safe_float(resolved_coord.get("lng"), None)
+                    if isinstance(resolved_coord, dict)
+                    else None
+                )
+                coordinate_source = (
+                    str(resolved_coord.get("coordinate_source", "")).strip()
+                    if isinstance(resolved_coord, dict)
+                    else ""
+                )
+                coordinate_confidence = _resolve_coordinate_confidence(resolved_coord)
+                override_attempted = False
+                override_result = "not_needed"
+                low_confidence_seed = (
+                    coordinate_confidence == "low"
+                    or coordinate_source.startswith("segment_midpoint")
+                )
+                forward_override_needed = lat is None or lng is None or low_confidence_seed
+                if (
+                    forward_override_needed
+                    and forward_geocode_enabled
+                    and forward_geocode_attempts < forward_geocode_limit
+                ):
+                    override_attempted = True
+                    forward_key = _build_scraping_cache_key(
+                        query_type="forward_geocode",
+                        geohash_or_loc=location_cache_token,
+                        keywords=location_name,
+                        minutes_back=0,
+                        limit=1,
+                        api_base=bluesky_api_base,
+                        extra_namespace=FORWARD_GEOCODE_DISAMBIG_VERSION,
+                    )
+                    cached_forward = _cache_get_rows(
+                        key=forward_key,
+                        expected_query_type="forward_geocode",
+                        max_rows=1,
+                        location_name=location_name,
+                    )
+                    if cached_forward is not None:
+                        if cached_forward and isinstance(cached_forward[0], dict):
+                            resolved_coord = dict(cached_forward[0])
+                            forward_diag = _extract_forward_geocode_diag(resolved_coord)
+                            lat = _safe_float(resolved_coord.get("lat"), None)
+                            lng = _safe_float(resolved_coord.get("lng"), None)
+                            override_result = "forward_geocode_cache_hit"
+                        else:
+                            override_result = "forward_geocode_cache_negative"
+                    else:
+                        forward_geocode_attempts += 1
+                        try:
+                            resolved_reverse_source = _resolve_municipality_reverse_source(
+                                payload.get(
+                                    "municipality_reverse_source",
+                                    os.getenv("MUNICIPALITY_REVERSE_SOURCE", "nominatim_reverse"),
+                                )
+                            )
+                            forward_coord = _forward_geocode_municipality(
+                                location_name=location_name,
+                                reverse_source=resolved_reverse_source,
+                                timeout_sec=forward_geocode_timeout_sec,
+                                country_codes=forward_geocode_country_codes,
+                            )
+                            forward_diag = _extract_forward_geocode_diag(forward_coord)
+                            forward_geocode_bad_admin_rejections += _safe_int(
+                                forward_diag.get(
+                                    "forward_geocode_rejected_broad_admin_count"
+                                ),
+                                0,
+                            )
+                            query_mode_used = _sanitize_forward_geocode_query_mode(
+                                forward_diag.get("forward_geocode_query_mode")
+                            )
+                            if query_mode_used != "none":
+                                forward_geocode_query_modes_used.add(query_mode_used)
+                            if isinstance(forward_coord, dict):
+                                resolved_coord = dict(forward_coord)
+                                lat = _safe_float(resolved_coord.get("lat"), None)
+                                lng = _safe_float(resolved_coord.get("lng"), None)
+                                if lat is not None and lng is not None:
+                                    forward_geocode_successes += 1
+                                    override_result = "forward_geocode_network_success"
+                                    _cache_set(
+                                        forward_key,
+                                        {
+                                            "version": SCRAPING_CACHE_KEY_VERSION,
+                                            "query_type": "forward_geocode",
+                                            "rows": [resolved_coord],
+                                            "risk_count": 0,
+                                            "fallback_count": 0,
+                                            "generated_at_utc": datetime.now(
+                                                tz=timezone.utc
+                                            ).isoformat(),
+                                        },
+                                    )
+                                else:
+                                    forward_geocode_failures += 1
+                                    override_result = "forward_geocode_network_empty"
+                                    _cache_set(
+                                        forward_key,
+                                        {
+                                            "version": SCRAPING_CACHE_KEY_VERSION,
+                                            "query_type": "forward_geocode",
+                                            "rows": [],
+                                            "risk_count": 0,
+                                            "fallback_count": 0,
+                                            "generated_at_utc": datetime.now(
+                                                tz=timezone.utc
+                                            ).isoformat(),
+                                        },
+                                    )
+                            else:
+                                forward_geocode_failures += 1
+                                override_result = "forward_geocode_network_empty"
+                                _cache_set(
+                                    forward_key,
+                                    {
+                                        "version": SCRAPING_CACHE_KEY_VERSION,
+                                        "query_type": "forward_geocode",
+                                        "rows": [],
+                                        "risk_count": 0,
+                                        "fallback_count": 0,
+                                        "generated_at_utc": datetime.now(
+                                            tz=timezone.utc
+                                        ).isoformat(),
+                                    },
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            forward_geocode_failures += 1
+                            override_result = "forward_geocode_network_error"
+                            _bounded_append_error(
+                                network_errors,
+                                f"{location_name} (forward_geocode): {exc}",
+                                max_errors=max_cache_errors,
+                            )
+                            _cache_set(
+                                forward_key,
+                                {
+                                    "version": SCRAPING_CACHE_KEY_VERSION,
+                                    "query_type": "forward_geocode",
+                                    "rows": [],
+                                    "risk_count": 0,
+                                    "fallback_count": 0,
+                                    "generated_at_utc": datetime.now(
+                                        tz=timezone.utc
+                                    ).isoformat(),
+                                },
+                            )
+
+                resolution_reason = (
+                    str(resolved_coord.get("resolution_reason", "")).strip()
+                    if isinstance(resolved_coord, dict)
+                    else ""
+                )
+                coordinate_source = (
+                    str(resolved_coord.get("coordinate_source", "")).strip()
+                    if isinstance(resolved_coord, dict)
+                    else ""
+                )
+                coordinate_confidence = _resolve_coordinate_confidence(resolved_coord)
+                forward_diag = _extract_forward_geocode_diag(resolved_coord) if (
+                    isinstance(resolved_coord, dict)
+                    and (
+                        str(resolved_coord.get("forward_geocode_query_mode", "")).strip()
+                        or _safe_int(
+                            resolved_coord.get("forward_geocode_candidate_count"), 0
+                        )
+                    )
+                ) else forward_diag
+
+                # Prevent low-confidence midpoint placements from silently creating wrong icons.
+                if (
+                    lat is not None
+                    and lng is not None
+                    and coordinate_confidence == "low"
+                    and override_result
+                    in {
+                        "not_needed",
+                        "forward_geocode_cache_negative",
+                        "forward_geocode_network_empty",
+                        "forward_geocode_network_error",
+                    }
+                ):
+                    low_confidence_resolutions_blocked += 1
+                    lat = None
+                    lng = None
+                    resolution_reason = "low_confidence_coordinate_blocked_for_icon"
+                location_resolution.append(
+                    {
+                        "location_name": location_name,
+                        "posts_count": combined_count,
+                        "resolved": lat is not None and lng is not None,
+                        "lat": round(float(lat), 6) if lat is not None else None,
+                        "lng": round(float(lng), 6) if lng is not None else None,
+                        "coordinate_source": coordinate_source,
+                        "resolution_reason": resolution_reason,
+                        "coordinate_confidence": coordinate_confidence,
+                        "override_attempted": override_attempted,
+                        "override_result": override_result,
+                        "forward_geocode_query_mode": forward_diag.get(
+                            "forward_geocode_query_mode", "none"
+                        ),
+                        "forward_geocode_selected_addresstype": forward_diag.get(
+                            "forward_geocode_selected_addresstype", ""
+                        ),
+                        "forward_geocode_selected_place_rank": forward_diag.get(
+                            "forward_geocode_selected_place_rank"
+                        ),
+                        "forward_geocode_candidate_count": _safe_int(
+                            forward_diag.get("forward_geocode_candidate_count"), 0
+                        ),
+                        "forward_geocode_rejected_broad_admin_count": _safe_int(
+                            forward_diag.get(
+                                "forward_geocode_rejected_broad_admin_count"
+                            ),
+                            0,
+                        ),
+                    }
                 )
                 if lat is None or lng is None:
                     normalized_name = _normalize_text_key(location_name)
                     if normalized_name and normalized_name not in unresolved_seen:
                         unresolved_seen.add(normalized_name)
                         unresolved_locations_for_icons.append(location_name)
+                        locations_with_posts_but_no_icon.append(location_name)
                 else:
                     municipality_points.append(
                         {
@@ -1157,10 +2269,10 @@ def _run_social_scraping(
                             "risk_count": risk_count,
                             "fallback_count": fallback_count,
                             "coordinate_source": (
-                                str(location_coord.get("coordinate_source") or "segment_midpoint")
-                                if isinstance(location_coord, dict)
-                                else "segment_midpoint"
+                                coordinate_source or "resolved"
                             ),
+                            "resolution_reason": resolution_reason or coordinate_source or "",
+                            "coordinate_confidence": coordinate_confidence,
                         }
                     )
 
@@ -1180,6 +2292,7 @@ def _run_social_scraping(
             status=status,
             message=message,
             keywords=keywords,
+            scraping_lang=scraping_lang,
             locations_requested=len(requested_location_names),
             locations_requested_keys=requested_location_names,
             locations_requested_names=requested_location_names,
@@ -1196,6 +2309,20 @@ def _run_social_scraping(
             cache_misses=cache_misses,
             cache_writes=cache_writes,
             cache_errors=cache_errors,
+            cache_miss_details=cache_miss_details,
+            cache_miss_details_count=cache_miss_total,
+            cache_miss_details_truncated=cache_miss_details_truncated,
+            cache_miss_by_reason=cache_miss_by_reason,
+            cache_miss_by_query_type=cache_miss_by_query_type,
+            location_resolution=location_resolution,
+            locations_with_posts_but_no_icon=locations_with_posts_but_no_icon,
+            forward_geocode_disambiguation_version=FORWARD_GEOCODE_DISAMBIG_VERSION,
+            forward_geocode_attempts=forward_geocode_attempts,
+            forward_geocode_successes=forward_geocode_successes,
+            forward_geocode_failures=forward_geocode_failures,
+            forward_geocode_bad_admin_rejections=forward_geocode_bad_admin_rejections,
+            forward_geocode_query_modes_used=sorted(forward_geocode_query_modes_used),
+            low_confidence_resolutions_blocked=low_confidence_resolutions_blocked,
             network_queries_attempted=network_queries_attempted,
             network_queries_succeeded=network_queries_succeeded,
             network_errors=network_errors,
@@ -1213,6 +2340,7 @@ def _run_social_scraping(
             status="failed",
             message=f"Social scraping execution failed: {exc}",
             keywords=keywords,
+            scraping_lang=scraping_lang,
             per_location_limit=per_location_limit,
             radius_km=radius_km,
             minutes_back=minutes_back,
@@ -1221,6 +2349,20 @@ def _run_social_scraping(
             cache_misses=cache_misses,
             cache_writes=cache_writes,
             cache_errors=cache_errors,
+            cache_miss_details=cache_miss_details,
+            cache_miss_details_count=cache_miss_total,
+            cache_miss_details_truncated=cache_miss_details_truncated,
+            cache_miss_by_reason=cache_miss_by_reason,
+            cache_miss_by_query_type=cache_miss_by_query_type,
+            location_resolution=location_resolution,
+            locations_with_posts_but_no_icon=locations_with_posts_but_no_icon,
+            forward_geocode_disambiguation_version=FORWARD_GEOCODE_DISAMBIG_VERSION,
+            forward_geocode_attempts=forward_geocode_attempts,
+            forward_geocode_successes=forward_geocode_successes,
+            forward_geocode_failures=forward_geocode_failures,
+            forward_geocode_bad_admin_rejections=forward_geocode_bad_admin_rejections,
+            forward_geocode_query_modes_used=sorted(forward_geocode_query_modes_used),
+            low_confidence_resolutions_blocked=low_confidence_resolutions_blocked,
             network_queries_attempted=network_queries_attempted,
             network_queries_succeeded=network_queries_succeeded,
             network_errors=network_errors,
@@ -2640,6 +3782,77 @@ HTML_PAGE = """
         color: #b43c00;
         font-weight: 700;
       }
+      .enrichment-progress-track {
+        width: 100%;
+        height: 8px;
+        border-radius: 999px;
+        background: #e6e6e6;
+        overflow: hidden;
+        margin-top: 8px;
+      }
+      .enrichment-progress-fill {
+        width: 0%;
+        height: 100%;
+        background: linear-gradient(90deg, #184c73 0%, #0a8754 100%);
+        transition: width 180ms ease;
+      }
+      .enrichment-stage-list {
+        margin-top: 8px;
+        display: grid;
+        gap: 6px;
+      }
+      .enrichment-stage-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 7px;
+        border: 1px solid #d9d9d9;
+        border-radius: 6px;
+        background: #ffffff;
+        font-size: 12px;
+      }
+      .enrichment-stage-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #b3b3b3;
+        border: 1px solid #9a9a9a;
+        flex: 0 0 auto;
+      }
+      .enrichment-stage-label {
+        flex: 1 1 auto;
+      }
+      .enrichment-stage-state {
+        color: #555;
+        font-weight: 700;
+        text-transform: uppercase;
+        font-size: 10px;
+        letter-spacing: 0.03em;
+      }
+      .enrichment-stage-row.active {
+        border-color: #184c73;
+        background: #eaf4ff;
+      }
+      .enrichment-stage-row.active .enrichment-stage-dot {
+        background: #184c73;
+        border-color: #184c73;
+      }
+      .enrichment-stage-row.done {
+        border-color: #0a8754;
+        background: #ebfbf3;
+      }
+      .enrichment-stage-row.done .enrichment-stage-dot {
+        background: #0a8754;
+        border-color: #0a8754;
+      }
+      .enrichment-stage-row.error {
+        border-color: #7a1b16;
+        background: #ffecea;
+      }
+      .enrichment-stage-row.error .enrichment-stage-dot {
+        background: #7a1b16;
+        border-color: #7a1b16;
+      }
     </style>
   </head>
   <body>
@@ -2692,6 +3905,11 @@ HTML_PAGE = """
           <span>Bluesky scraping for municipality risk signals</span>
         </label>
         <div class="small">When enabled, backend scrapes recent Bluesky posts for the municipalities detected in your routes.</div>
+      </div>
+      <div class="row">
+        <label>Bluesky language filter (BCP-47)</label>
+        <input id="scrapingLang" type="text" value="es" />
+        <div class="small">Use codes like <code>es</code> or <code>es-ES</code>. Leave empty to disable language filtering.</div>
       </div>
 
       <div class="row" style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
@@ -2785,8 +4003,14 @@ HTML_PAGE = """
       <div class="row">
         <strong>Output</strong>
         <pre id="output">Waiting for data...</pre>
+        <strong>Enrichment Progress</strong>
+        <div id="enrichmentProgress" class="llm-added-box">Idle. Run municipality enrichment to see staged progress.</div>
+        <div class="enrichment-progress-track"><div id="enrichmentProgressFill" class="enrichment-progress-fill"></div></div>
+        <div id="enrichmentStageList" class="enrichment-stage-list"></div>
         <strong>LLM Added Municipalities</strong>
         <div id="llmAddedSummary" class="llm-added-box">Run municipality enrichment to see LLM-added municipalities.</div>
+        <strong>Bluesky Preview Posts</strong>
+        <div id="scrapingPreviewSummary" class="llm-added-box">Run municipality enrichment with scraping enabled to preview Bluesky posts.</div>
         <div class="small">Click map dots to inspect semantic + weather + traffic details.</div>
         <div class="legend">
           <div class="legend-title">Map Legend</div>
@@ -2825,6 +4049,7 @@ HTML_PAGE = """
       let lastSolvePayload = null;
       let lastSolveResult = null;
       let phase1PointByCoord = new Map();
+      let enrichmentStageState = [];
       const OSRM_PUBLIC_BASE_URL = 'https://router.project-osrm.org';
 
       const colors = ['#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#a65628'];
@@ -2981,6 +4206,94 @@ HTML_PAGE = """
         municipalityBtn.textContent = busy ? 'Tracing municipalities...' : 'Add Municipality Trace';
       }
 
+      function setEnrichmentProgress(message) {
+        const box = document.getElementById('enrichmentProgress');
+        if (!box) {
+          return;
+        }
+        box.textContent = String(message || '').trim() || 'Idle.';
+      }
+
+      function renderEnrichmentStages() {
+        const list = document.getElementById('enrichmentStageList');
+        const fill = document.getElementById('enrichmentProgressFill');
+        if (!list || !fill) {
+          return;
+        }
+        if (!Array.isArray(enrichmentStageState) || enrichmentStageState.length === 0) {
+          list.innerHTML = '';
+          fill.style.width = '0%';
+          return;
+        }
+
+        const doneCount = enrichmentStageState.filter(row => row?.status === 'done').length;
+        const total = enrichmentStageState.length;
+        const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0;
+        fill.style.width = `${pct}%`;
+
+        const stateLabel = (status) => {
+          if (status === 'done') {
+            return 'Done';
+          }
+          if (status === 'active') {
+            return 'Running';
+          }
+          if (status === 'error') {
+            return 'Failed';
+          }
+          return 'Pending';
+        };
+
+        list.innerHTML = enrichmentStageState
+          .map(row => {
+            const status = String(row?.status || 'pending').trim().toLowerCase();
+            const label = escapeHtml(String(row?.label || 'Stage'));
+            const badge = escapeHtml(stateLabel(status));
+            return `
+              <div class="enrichment-stage-row ${escapeHtml(status)}">
+                <span class="enrichment-stage-dot"></span>
+                <span class="enrichment-stage-label">${label}</span>
+                <span class="enrichment-stage-state">${badge}</span>
+              </div>
+            `;
+          })
+          .join('');
+      }
+
+      function setEnrichmentStages(labels) {
+        enrichmentStageState = Array.isArray(labels)
+          ? labels.map(label => ({ label: String(label || 'Stage'), status: 'pending' }))
+          : [];
+        renderEnrichmentStages();
+      }
+
+      function setEnrichmentStageStatus(index, status) {
+        if (!Array.isArray(enrichmentStageState)) {
+          return;
+        }
+        if (!Number.isInteger(index) || index < 0 || index >= enrichmentStageState.length) {
+          return;
+        }
+        enrichmentStageState[index] = {
+          ...enrichmentStageState[index],
+          status: String(status || 'pending').trim().toLowerCase() || 'pending'
+        };
+        renderEnrichmentStages();
+      }
+
+      function resetEnrichmentPanels() {
+        setEnrichmentProgress('Idle. Run municipality enrichment to see staged progress.');
+        setEnrichmentStages([]);
+        const llmBox = document.getElementById('llmAddedSummary');
+        if (llmBox) {
+          llmBox.textContent = 'Run municipality enrichment to see LLM-added municipalities.';
+        }
+        const scrapeBox = document.getElementById('scrapingPreviewSummary');
+        if (scrapeBox) {
+          scrapeBox.textContent = 'Run municipality enrichment with scraping enabled to preview Bluesky posts.';
+        }
+      }
+
       function readPoiAutoSettings() {
         const enabled = document.getElementById('autoPoiEnabled')?.checked === true;
         const radiusRaw = Number.parseFloat(document.getElementById('poiAutoRadiusKm')?.value || '3');
@@ -2993,8 +4306,12 @@ HTML_PAGE = """
       }
 
       function readScrapingSettings() {
+        const scrapingLang = String(
+          document.getElementById('scrapingLang')?.value || ''
+        ).trim().toLowerCase();
         return {
-          scraping_enabled: document.getElementById('scrapingEnabled')?.checked === true
+          scraping_enabled: document.getElementById('scrapingEnabled')?.checked === true,
+          scraping_lang: scrapingLang
         };
       }
 
@@ -3182,6 +4499,57 @@ HTML_PAGE = """
           }
         }
         box.innerHTML = lines.length > 0 ? lines.join('<br/>') : 'No LLM-added municipalities reported.';
+      }
+
+      function renderScrapingPreviewSummary(data) {
+        const box = document.getElementById('scrapingPreviewSummary');
+        if (!box) {
+          return;
+        }
+        const scraping = data?.scraping || {};
+        const rows = Array.isArray(scraping?.preview_rows) ? scraping.preview_rows : [];
+        const status = String(scraping?.status || '').trim().toLowerCase();
+        const enabled = scraping?.enabled === true;
+        const stageAllowed = scraping?.stage_allowed !== false;
+
+        if (!enabled) {
+          box.textContent = 'Bluesky scraping is disabled.';
+          return;
+        }
+        if (!stageAllowed || status === 'skipped_stage') {
+          const reason = String(scraping?.stage_skip_reason || '').trim();
+          box.textContent = reason
+            ? `Bluesky scraping skipped by stage policy (${reason}).`
+            : 'Bluesky scraping skipped by stage policy.';
+          return;
+        }
+        if (rows.length === 0) {
+          box.textContent = 'No Bluesky preview rows returned for this run.';
+          return;
+        }
+
+        const topRows = rows.slice(0, 20);
+        const rendered = [];
+        for (const row of topRows) {
+          const location = escapeHtml(String(row?.location_name || 'Unknown'));
+          const username = escapeHtml(String(row?.username || 'unknown'));
+          const created = escapeHtml(String(row?.created_at || 'n/a'));
+          const classification = escapeHtml(String(row?.classification || '').trim() || 'post');
+          const rawText = String(row?.text || '').trim();
+          const text = rawText.length > 180 ? `${rawText.slice(0, 177)}...` : rawText;
+          const safeText = escapeHtml(text || '(empty text)');
+          const url = String(row?.tweet_url || '').trim();
+          const linkHtml = url
+            ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Open post</a>`
+            : '';
+          rendered.push(
+            `<strong>${location}</strong> [${classification}] @${username} (${created})<br/>${safeText}${linkHtml ? `<br/>${linkHtml}` : ''}`
+          );
+        }
+        const more = rows.length > topRows.length
+          ? `<br/><br/>Showing ${topRows.length} of ${rows.length} posts.`
+          : '';
+        box.innerHTML = rendered.join('<br/><br/>') + more;
       }
 
       function municipalityNameKey(value) {
@@ -3573,6 +4941,23 @@ HTML_PAGE = """
         }
       }
 
+      function scrapingDebugNotice(data) {
+        const scraping = data?.scraping || {};
+        const unresolved = Array.isArray(scraping?.locations_with_posts_but_no_icon)
+          ? scraping.locations_with_posts_but_no_icon
+          : [];
+        if (unresolved.length === 0) {
+          return '';
+        }
+        const unique = Array.from(new Set(unresolved.map(v => String(v || '').trim()).filter(Boolean)));
+        if (unique.length === 0) {
+          return '';
+        }
+        const sample = unique.slice(0, 20).join(', ');
+        const suffix = unique.length > 20 ? ` (+${unique.length - 20} more)` : '';
+        return `Social markers unresolved (posts found but no icon coordinate): ${sample}${suffix}`;
+      }
+
       async function fetchOsrmRoadGeometry(stops) {
         if (!Array.isArray(stops) || stops.length < 2) {
           return null;
@@ -3722,9 +5107,14 @@ HTML_PAGE = """
       async function renderResult(data, payload) {
         const jsonOutput = JSON.stringify(data, null, 2);
         const fallbackNotice = municipalityOutputNotice(data);
-        document.getElementById('output').textContent = `${jsonOutput}\n\n${fallbackNotice}`;
+        const scrapingNotice = scrapingDebugNotice(data);
+        const notices = [fallbackNotice, scrapingNotice].filter(Boolean);
+        document.getElementById('output').textContent = notices.length > 0
+          ? `${jsonOutput}\n\n${notices.join('\\n\\n')}`
+          : jsonOutput;
         lastCandidateLocations = Array.isArray(data?.candidate_locations) ? data.candidate_locations : [];
         renderLlmAddedMunicipalities(data);
+        renderScrapingPreviewSummary(data);
         applyPhase1InputPoints(data);
         redrawPoints();
 
@@ -3784,7 +5174,7 @@ HTML_PAGE = """
         clearRoutes();
         redrawPoints();
         document.getElementById('output').textContent = 'Waiting for data...';
-        document.getElementById('llmAddedSummary').textContent = 'Run municipality enrichment to see LLM-added municipalities.';
+        resetEnrichmentPanels();
       });
 
       function loadAutogenPreset(preset) {
@@ -3830,7 +5220,7 @@ HTML_PAGE = """
         setMunicipalityButtonState(false);
         clearRoutes();
         redrawPoints();
-        document.getElementById('llmAddedSummary').textContent = 'Run municipality enrichment to see LLM-added municipalities.';
+        resetEnrichmentPanels();
       }
 
       document.getElementById('autogenBtn').addEventListener('click', () => {
@@ -3867,6 +5257,7 @@ HTML_PAGE = """
         payload.poi_auto_max_candidates = poiAutoSettings.poi_auto_max_candidates;
         const scrapingSettings = readScrapingSettings();
         payload.scraping_enabled = scrapingSettings.scraping_enabled;
+        payload.scraping_lang = scrapingSettings.scraping_lang;
         const llmSettings = readMunicipalityLlmSettings();
         payload.municipality_llm_enrichment_enabled = llmSettings.municipality_llm_enrichment_enabled;
         payload.municipality_llm_timeout_sec = llmSettings.municipality_llm_timeout_sec;
@@ -3883,7 +5274,8 @@ HTML_PAGE = """
         document.getElementById('output').textContent = payload.poi_auto_enabled
           ? 'Solving VRP + HERE enrichment... (POI check deferred to Municipality Trace phase)'
           : 'Solving VRP + HERE enrichment...';
-        document.getElementById('llmAddedSummary').textContent = 'Run municipality enrichment to see LLM-added municipalities.';
+        resetEnrichmentPanels();
+        setEnrichmentProgress('Solving VRP... Municipality staged enrichment will be available after solve.');
         try {
           const data = await solveAndRender(payload);
           const returnedCandidates = Array.isArray(data?.candidate_locations)
@@ -3893,10 +5285,13 @@ HTML_PAGE = """
             ? { ...payload, candidate_locations: returnedCandidates }
             : payload;
           lastSolveResult = data;
+          setEnrichmentProgress('VRP completed. Click "Add Municipality Trace" to run staged municipality/LLM/scraping updates.');
           setMunicipalityButtonState(true);
         } catch (err) {
           document.getElementById('output').textContent = err.message || 'Error solving VRP';
+          setEnrichmentProgress('VRP failed. Fix the error and run Solve VRP again.');
           document.getElementById('llmAddedSummary').textContent = 'LLM municipality additions unavailable due to solve error.';
+          document.getElementById('scrapingPreviewSummary').textContent = 'Bluesky preview unavailable due to solve error.';
           lastSolvePayload = null;
           lastSolveResult = null;
           setMunicipalityButtonState(false);
@@ -3908,44 +5303,115 @@ HTML_PAGE = """
           alert('Run Solve VRP first.');
           return;
         }
-        const payload = {
+        const basePayload = {
           ...lastSolvePayload,
           departure_time_utc: new Date().toISOString(),
           municipality_enrichment_enabled: true
         };
         const poiAutoSettings = readPoiAutoSettings();
-        payload.poi_auto_enabled = poiAutoSettings.poi_auto_enabled;
-        payload.poi_auto_radius_km = poiAutoSettings.poi_auto_radius_km;
-        payload.poi_auto_max_candidates = poiAutoSettings.poi_auto_max_candidates;
+        basePayload.poi_auto_enabled = poiAutoSettings.poi_auto_enabled;
+        basePayload.poi_auto_radius_km = poiAutoSettings.poi_auto_radius_km;
+        basePayload.poi_auto_max_candidates = poiAutoSettings.poi_auto_max_candidates;
         const scrapingSettings = readScrapingSettings();
-        payload.scraping_enabled = scrapingSettings.scraping_enabled;
+        basePayload.scraping_enabled = scrapingSettings.scraping_enabled;
+        basePayload.scraping_lang = scrapingSettings.scraping_lang;
         const llmSettings = readMunicipalityLlmSettings();
-        payload.municipality_llm_enrichment_enabled = llmSettings.municipality_llm_enrichment_enabled;
-        payload.municipality_llm_timeout_sec = llmSettings.municipality_llm_timeout_sec;
-        payload.municipality_llm_retries = llmSettings.municipality_llm_retries;
-        payload.municipality_llm_max_tokens = llmSettings.municipality_llm_max_tokens;
-        payload.municipality_reverse_source = readMunicipalityReverseSource();
+        basePayload.municipality_llm_enrichment_enabled = llmSettings.municipality_llm_enrichment_enabled;
+        basePayload.municipality_llm_timeout_sec = llmSettings.municipality_llm_timeout_sec;
+        basePayload.municipality_llm_retries = llmSettings.municipality_llm_retries;
+        basePayload.municipality_llm_max_tokens = llmSettings.municipality_llm_max_tokens;
+        basePayload.municipality_reverse_source = readMunicipalityReverseSource();
+
+        const llmEnabled = basePayload.municipality_llm_enrichment_enabled === true;
+        const scrapingEnabled = basePayload.scraping_enabled === true;
+        const stages = [];
+        stages.push({
+          label: 'Municipality trace + POI (before LLM)',
+          apply: (payload) => {
+            payload.municipality_llm_enrichment_enabled = false;
+            payload.scraping_enabled = false;
+          }
+        });
+        if (llmEnabled) {
+          stages.push({
+            label: 'LLM municipality enrichment',
+            apply: (payload) => {
+              payload.municipality_llm_enrichment_enabled = true;
+              payload.scraping_enabled = false;
+            }
+          });
+        }
+        if (scrapingEnabled) {
+          stages.push({
+            label: 'Social scraping + marker update',
+            apply: (payload) => {
+              payload.municipality_llm_enrichment_enabled = llmEnabled;
+              payload.scraping_enabled = true;
+            }
+          });
+        }
+
         setMunicipalityButtonState(true, true);
-        document.getElementById('output').textContent = payload.municipality_llm_enrichment_enabled
-          ? 'Computing municipality trace with OSM + LLM...'
-          : 'Computing municipality trace with OSM (LLM disabled)...';
+        let workingResult = lastSolveResult;
+        let workingPayload = { ...basePayload };
+        let currentStageIndex = -1;
+        setEnrichmentStages(stages.map(stage => stage.label));
         try {
-          const data = await enrichMunicipalityAndRender(payload, lastSolveResult);
-          const returnedCandidates = Array.isArray(data?.candidate_locations)
-            ? data.candidate_locations
+          for (let i = 0; i < stages.length; i += 1) {
+            const stage = stages[i];
+            currentStageIndex = i;
+            const stagePayload = {
+              ...workingPayload,
+              departure_time_utc: new Date().toISOString(),
+              municipality_enrichment_enabled: true
+            };
+            stage.apply(stagePayload);
+            const stageHeader = `Stage ${i + 1}/${stages.length}: ${stage.label}`;
+            setEnrichmentProgress(`${stageHeader}...`);
+            setEnrichmentStageStatus(i, 'active');
+            document.getElementById('output').textContent = `${stageHeader}...`;
+
+            const data = await enrichMunicipalityAndRender(stagePayload, workingResult);
+            workingResult = data;
+            const returnedCandidates = Array.isArray(data?.candidate_locations)
+              ? data.candidate_locations
+              : [];
+            workingPayload = {
+              ...workingPayload,
+              municipality_llm_enrichment_enabled: stagePayload.municipality_llm_enrichment_enabled,
+              scraping_enabled: stagePayload.scraping_enabled,
+              ...(returnedCandidates.length > 0
+                ? { candidate_locations: returnedCandidates }
+                : {})
+            };
+            setEnrichmentStageStatus(i, 'done');
+            setEnrichmentProgress(`${stageHeader} completed.`);
+          }
+
+          const finalCandidates = Array.isArray(workingResult?.candidate_locations)
+            ? workingResult.candidate_locations
             : [];
           lastSolvePayload = {
             ...lastSolvePayload,
+            ...workingPayload,
             municipality_enrichment_enabled: true,
-            ...(returnedCandidates.length > 0
-              ? { candidate_locations: returnedCandidates }
+            ...(finalCandidates.length > 0
+              ? { candidate_locations: finalCandidates }
               : {})
           };
-          lastSolveResult = data;
+          lastSolveResult = workingResult;
+          setEnrichmentProgress(
+            `Municipality enrichment finished (${stages.length} stage${stages.length === 1 ? '' : 's'}).`
+          );
           setMunicipalityButtonState(true);
         } catch (err) {
           document.getElementById('output').textContent = err.message || 'Error computing municipality trace';
           document.getElementById('llmAddedSummary').textContent = 'LLM municipality additions unavailable due to enrichment error.';
+          document.getElementById('scrapingPreviewSummary').textContent = 'Bluesky preview unavailable due to enrichment error.';
+          if (Number.isInteger(currentStageIndex) && currentStageIndex >= 0) {
+            setEnrichmentStageStatus(currentStageIndex, 'error');
+          }
+          setEnrichmentProgress(`Municipality enrichment failed: ${String(err?.message || 'unknown error')}`);
           setMunicipalityButtonState(true);
         }
       });
